@@ -1,0 +1,4 @@
+[target]
+url = "https://github.com/cosmicpython/code.git"
+commit = "14c84797ffa77255d53cf1a02fe6aafda2b68aeb"
+regression_tests = "tests/unit"

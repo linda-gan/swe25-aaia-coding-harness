@@ -46,6 +46,7 @@ TASK = Task(
     description="Reject quantities of zero or less.",
     editable_files=["src/app/model.py"],
     agent_checks=["unit_tests"],
+    final_checks=["acceptance", "unit_tests"],
 )
 
 
@@ -218,3 +219,14 @@ def test_thinking_is_shown_as_progress(repo):
     run = controller.run()
     assert run.events[0].kind == "thinking"
     assert "probably in model.py" in run.events[0].message
+
+
+def test_events_and_run_record_elapsed_time(repo):
+    controller, _ = make_controller(repo, [
+        tool_reply("list_files"),
+        tool_reply("finish", summary="done"),
+    ])
+    run = controller.run()
+    times = [e.elapsed_seconds for e in run.events]
+    assert times == sorted(times)  # never goes backwards
+    assert run.duration_seconds >= times[-1] >= 0

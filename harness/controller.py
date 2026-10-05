@@ -11,6 +11,7 @@ succeeded; the harness checks that separately afterwards.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -41,6 +42,7 @@ class Event:
     """One line of progress, for the interface to show and for the run log."""
     kind: str  # thinking, model, action, result, refused, retry, stop
     message: str
+    elapsed_seconds: float = 0.0  # since the agent run started
 
 
 @dataclass
@@ -50,6 +52,7 @@ class RunResult:
     actions: int = 0  # tool calls that were attempted (finish not counted)
     denied: int = 0  # tool calls that were refused or failed
     retries: int = 0  # replies without a usable tool call
+    duration_seconds: float = 0.0  # from the first model request to the stop
     messages: list[dict] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
 
@@ -80,6 +83,7 @@ class AgentController:
     # ---- the loop ----------------------------------------------------------
 
     def run(self) -> RunResult:
+        self._start = time.monotonic()
         run = RunResult(stop_reason="", messages=[
             {"role": "system", "content": system_prompt(self.task)},
             {"role": "user", "content": self.task.description},
@@ -171,13 +175,14 @@ class AgentController:
         run.messages.append({"role": "tool", "tool_name": _short(name), "content": content})
 
     def _emit(self, run: RunResult, kind: str, message: str) -> None:
-        event = Event(kind, message)
+        event = Event(kind, message, round(time.monotonic() - self._start, 1))
         run.events.append(event)
         if self.on_event:
             self.on_event(event)
 
     def _stop(self, run: RunResult, reason: str, detail: str = "") -> RunResult:
         run.stop_reason = reason
+        run.duration_seconds = round(time.monotonic() - self._start, 1)
         self._emit(run, "stop", f"{reason}: {detail}" if detail else reason)
         return run
 

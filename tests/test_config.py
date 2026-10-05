@@ -33,6 +33,7 @@ def test_loads_task_and_its_checks_exist():
     assert "InvalidQuantity" in task.description
     assert "src/allocation/service_layer/handlers.py" in task.editable_files
     assert set(task.agent_checks) <= set(load_config().checks)
+    assert task.final_checks == ["acceptance", "unit_tests"]
 
 
 def test_loads_model_settings():

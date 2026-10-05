@@ -16,3 +16,7 @@ editable_files = [
 # Checks the agent may run itself. The acceptance check is not listed:
 # the harness runs it after the agent is done.
 agent_checks = ["unit_tests"]
+
+# Checks the harness runs itself after the agent stops, whatever the model
+# says. The task passes only if all of them pass.
+final_checks = ["acceptance", "unit_tests"]

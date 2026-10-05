@@ -44,7 +44,7 @@ TOOLS: dict[str, ToolSpec] = {
     ),
     "search": ToolSpec(
         "Find lines containing some text. Returns path:line: text for each match.",
-        {"query": Param("Exact text to look for (case-sensitive)."),
+        {"query": Param("Exact text to look for (case-sensitive, plain text, not a regular expression)."),
          "path": Param("File or folder to search. Default: whole repository.", required=False)},
     ),
     "edit_file": ToolSpec(

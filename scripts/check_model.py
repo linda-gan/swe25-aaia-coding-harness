@@ -2,7 +2,6 @@
 
 Usage, from the project root:
     python -m scripts.check_model                          # model from the config
-    python -m scripts.check_model --model qwen2.5-coder:3b # another model
 """
 import argparse
 import dataclasses

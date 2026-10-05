@@ -2,7 +2,7 @@
 
 The controller only knows ModelClient. Tests use ScriptedModelClient, which
 plays back prepared replies, so they run without a model, account or API key.
-The real Ollama client is added in the next step.
+The real client for Ollama is in harness/ollama_client.py.
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ class ToolCall:
 class ModelReply:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    thinking: str = ""  # the model's reasoning, if thinking mode is on
 
 
 class ModelClient(Protocol):

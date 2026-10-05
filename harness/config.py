@@ -32,10 +32,20 @@ class LimitsConfig:
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    host: str
+    name: str
+    think: bool
+    num_ctx: int
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     target: TargetConfig
     sandbox: SandboxConfig
     limits: LimitsConfig
+    model: ModelConfig
     checks: dict[str, list[str]]
 
 
@@ -65,6 +75,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> HarnessConfig:
         target=TargetConfig(**data["target"]),
         sandbox=SandboxConfig(**data["sandbox"]),
         limits=LimitsConfig(**data["limits"]),
+        model=ModelConfig(**data["model"]),
         checks=checks,
     )
 

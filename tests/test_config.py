@@ -33,3 +33,12 @@ def test_loads_task_and_its_checks_exist():
     assert "InvalidQuantity" in task.description
     assert "src/allocation/service_layer/handlers.py" in task.editable_files
     assert set(task.agent_checks) <= set(load_config().checks)
+
+
+def test_loads_model_settings():
+    from harness.config import load_config
+
+    model = load_config().model
+    assert model.host.startswith("http://")
+    assert model.name
+    assert model.num_ctx >= 16384

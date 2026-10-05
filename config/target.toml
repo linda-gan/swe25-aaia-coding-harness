@@ -20,3 +20,10 @@ max_actions = 30            # tool calls per run
 max_denied_actions = 10     # refused or failed tool calls per run
 max_retries = 3             # replies in a row without a usable tool call
 max_tool_output_chars = 6000
+
+[model]
+host = "http://localhost:11434"
+name = "qwen3.6:35b"
+think = true                # let the model reason before answering (slower, usually better)
+num_ctx = 32768             # context window in tokens; Ollama's default is smaller
+timeout_seconds = 600       # per model reply; the first reply also loads the model

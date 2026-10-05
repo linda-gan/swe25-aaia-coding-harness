@@ -39,7 +39,7 @@ INTERNAL_ERROR = "internal error"
 @dataclass(frozen=True)
 class Event:
     """One line of progress, for the interface to show and for the run log."""
-    kind: str  # model, action, result, refused, retry, stop
+    kind: str  # thinking, model, action, result, refused, retry, stop
     message: str
 
 
@@ -93,6 +93,8 @@ class AgentController:
                 return self._stop(run, MODEL_ERROR, f"The model request failed: {exc}")
 
             run.messages.append(_assistant_message(reply))
+            if reply.thinking.strip():
+                self._emit(run, "thinking", _short(" ".join(reply.thinking.split()), 300))
             if reply.text.strip():
                 self._emit(run, "model", reply.text.strip())
 

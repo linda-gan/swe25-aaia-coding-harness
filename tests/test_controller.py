@@ -208,3 +208,13 @@ def test_model_error_stops_the_run_cleanly(repo):
     run = controller.run()
     assert run.stop_reason == MODEL_ERROR
     assert run.events[-1].kind == "stop"
+
+
+def test_thinking_is_shown_as_progress(repo):
+    controller, _ = make_controller(repo, [
+        ModelReply(thinking="The bug is probably in model.py.", tool_calls=[ToolCall("list_files", {})]),
+        tool_reply("finish", summary="done"),
+    ])
+    run = controller.run()
+    assert run.events[0].kind == "thinking"
+    assert "probably in model.py" in run.events[0].message

@@ -2,3 +2,15 @@
 url = "https://github.com/cosmicpython/code.git"
 commit = "14c84797ffa77255d53cf1a02fe6aafda2b68aeb"
 regression_tests = "tests/unit"
+
+[sandbox]
+image = "cosmic-sandbox"
+timeout_seconds = 120
+memory = "1g"
+cpus = "1"
+max_output_chars = 8000
+
+# The only commands that can run in the sandbox, by name.
+[checks]
+unit_tests = ["pytest", "tests/unit", "-q", "-p", "no:cacheprovider"]
+acceptance = ["pytest", "/acceptance", "-q", "-p", "no:cacheprovider"]

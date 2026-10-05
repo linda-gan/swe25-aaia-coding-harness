@@ -14,7 +14,39 @@ class TargetConfig:
     regression_tests: str
 
 
-def load_target_config(path: Path = DEFAULT_CONFIG) -> TargetConfig:
+@dataclass(frozen=True)
+class SandboxConfig:
+    image: str
+    timeout_seconds: int
+    memory: str
+    cpus: str
+    max_output_chars: int
+
+
+@dataclass(frozen=True)
+class HarnessConfig:
+    target: TargetConfig
+    sandbox: SandboxConfig
+    checks: dict[str, list[str]]
+
+
+def _read(path: Path) -> dict:
     with open(path, "rb") as f:
-        data = tomllib.load(f)["target"]
-    return TargetConfig(**data)
+        return tomllib.load(f)
+
+
+def load_target_config(path: Path = DEFAULT_CONFIG) -> TargetConfig:
+    return TargetConfig(**_read(path)["target"])
+
+
+def load_config(path: Path = DEFAULT_CONFIG) -> HarnessConfig:
+    data = _read(path)
+    checks = data["checks"]
+    for name, argv in checks.items():
+        if not argv or not all(isinstance(part, str) for part in argv):
+            raise ValueError(f"Check {name!r} must be a non-empty list of strings.")
+    return HarnessConfig(
+        target=TargetConfig(**data["target"]),
+        sandbox=SandboxConfig(**data["sandbox"]),
+        checks=checks,
+    )

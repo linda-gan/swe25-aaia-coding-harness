@@ -14,3 +14,9 @@ max_output_chars = 8000
 [checks]
 unit_tests = ["pytest", "tests/unit", "-q", "-p", "no:cacheprovider"]
 acceptance = ["pytest", "/acceptance", "-q", "-p", "no:cacheprovider"]
+
+[limits]
+max_actions = 30            # tool calls per run
+max_denied_actions = 10     # refused or failed tool calls per run
+max_retries = 3             # replies in a row without a usable tool call
+max_tool_output_chars = 6000

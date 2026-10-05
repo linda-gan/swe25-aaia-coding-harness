@@ -1,0 +1,18 @@
+# The Stage 1 task: what the agent is asked to do and what it may change.
+description = """
+Allocating an order line with a quantity of zero or less must be rejected.
+The allocate handler should raise a new exception InvalidQuantity in
+src/allocation/service_layer/handlers.py. Rejected allocations must not
+change batch stock and must not trigger an out-of-stock notification.
+Do not modify tests.
+"""
+
+# Only these files may be edited. Paths are relative to the repository root.
+editable_files = [
+    "src/allocation/service_layer/handlers.py",
+    "src/allocation/domain/model.py",
+]
+
+# Checks the agent may run itself. The acceptance check is not listed:
+# the harness runs it after the agent is done.
+agent_checks = ["unit_tests"]

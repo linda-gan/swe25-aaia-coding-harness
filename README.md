@@ -31,10 +31,13 @@ With thinking off, each model reply is faster, but the agent took more steps: it
 | `20261103-164853-9f8863` | after context step | `invalid_quantity` | 12 of 30 | 109.8 s | finished | PASSED |
 | `20261103-165247-037874` | after context step | `batch_expiry` | 30 of 30 | 217.5 s | action limit reached | PASSED |
 | `20261103-172351-de62cc` | with edit-test-fix loop | `batch_expiry` | 19 of 40 | 193.2 s | finished (0 fix rounds) | PASSED |
+| `20261103-182039-0afa9e` | with safe resume | `batch_expiry` | 21 of 40 | not summed (two parts) | cancelled with Ctrl+C after 12 actions, resumed, then finished | PASSED |
 
 The feature run changed all four modules, including the database mapping, and every final check passed (acceptance 9 of 9). The model's design differs from the reference solution: it passes `today` into the domain model instead of reading the clock there. But the run hit the action limit just before calling `finish`. About 10 of its 30 actions were repeats: it read the four files twice at the start, and at the end it read them all again and re-ran both checks "to verify". The next step answered this. The harness now runs the checks itself at `finish`, and the prompt says that re-checking only to confirm isn't needed. The feature task also got its own limit of 40 actions.
 
 With the edit-test-fix loop, the feature run took 19 actions, with no repeated reads at the start. It reviewed its work with one `git_diff` instead of re-reading four files, and the harness's checks at `finish` passed at the first attempt. The model also caught a mistake of its own: it had written `handlers.InvalidExpiry` inside `handlers.py`, re-read the file and fixed it before running any check.
+
+The last run was cancelled with Ctrl+C in the middle of the work, after 12 actions. `resume` checked the session, found the working copy as it was at the checkpoint, and continued with the saved conversation and the 28 actions left. The model went on from where it was and finished after 21 actions in total. Its design is different again: it keeps "today" in a module-level variable in `model.py` with a `set_todays_date()` function. All final checks passed. This shows once more that the checks judge behavior, not design. A reviewer could still prefer the reference solution's design.
 
 ## Target and task
 
@@ -115,7 +118,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 python -m harness fetch cosmicpython      # clean clone of Cosmic Python at the pinned commit
-docker build -t cosmic-sandbox sandbox/    # sandbox image with Cosmic Python's dependencies
+docker build -t cosmic-sandbox sandbox/    # sandbox image with Cosmic Python's dependencies and pyflakes
 docker pull python:3.12-slim               # used by the sandbox tests
 ollama pull qwen3.6:35b
 ```
@@ -124,7 +127,7 @@ Check the setup:
 
 ```bash
 python -m harness projects      # the allowed project, its clone (should say "ready") and tasks
-pytest                          # 254 tests, no model needed
+pytest                          # 306 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -152,11 +155,14 @@ python -m harness sessions                  # all sessions: status, steps, actio
 python -m harness show 172351-de62cc        # one session; a unique start or end of the ID is enough
 python -m harness show de62cc --history     # also the saved conversation
 python -m harness cancel 174819-970add      # stop a running session (from another terminal)
+python -m harness resume 29d170             # continue a cancelled, interrupted or paused session
+python -m harness resume 29d170 --accept-current-state   # after checking a reported difference
+python -m harness review de62cc             # run the final checks again on a stopped session
 ```
 
 `python -m scripts.scripted_feature_run` shows the edit-test-fix loop on the feature task without a model (it needs Docker): a scripted "model" forgets the database mapping, the harness's checks at `finish` fail, the script fixes it in fix round 1, and the second `finish` passes.
 
-`run` prints the task, live progress for every step (thinking, action, result, refusals), the agent's stop reason, the harness's own verification, the changed files, the colored diff, a PASSED or FAILED result, and the timing.
+`run` prints the task, live progress for every step (thinking, action, result, refusals), the agent's stop reason, the harness's own verification, the changed files, the colored diff, the unfinished work, a PASSED or FAILED result, and the timing.
 
 Each run gets its own folder, so runs never overwrite each other:
 
@@ -172,7 +178,7 @@ workspace/runs/<date-time-id>/
   changes.diff   the resulting diff
 ```
 
-Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` cancelled (Ctrl+C or `cancel`).
+Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `3` resume paused (see the reasons), `130` cancelled (Ctrl+C or `cancel`). `review` uses `0` and `1` the same way.
 
 `python -m scripts.scripted_run <repo copy>` runs the whole pipeline with a scripted model that applies the known fix. It's useful for checking the tools and sandbox without a real model.
 
@@ -184,8 +190,8 @@ Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` c
 
 | Section | Contents |
 |---|---|
-| `[projects.<name>]` | one entry per allowed project: repository URL, pinned commit, pristine clone folder, sandbox image |
-| `[projects.<name>.checks]` | the only commands that can run in that project's sandbox, by name: `unit_tests`, `acceptance`, `integration_sqlite` for `cosmicpython` |
+| `[projects.<name>]` | one entry per allowed project: repository URL, pinned commit, pristine clone folder, sandbox image, and `baseline_checks`: checks judged against the starting code (`lint` for `cosmicpython`, see Verification and review) |
+| `[projects.<name>.checks]` | the only commands that can run in that project's sandbox, by name: `unit_tests`, `acceptance`, `integration_sqlite`, `lint` (pyflakes) and `build` (compileall) for `cosmicpython` |
 | `[sandbox]` | shared by all projects: 120 s time limit per check, 1 GB memory, 1 CPU, 8,000-character output limit |
 | `[context]` | what is sent to the model per request: 24,000-token limit, 6 newest results kept in full, 3,000-character repository map, outlines of 4 selected files in 4,000 characters (see Context management) |
 | `[limits]` | 30 actions by default (a task may set its own, up to a ceiling of 60), 10 refused actions, 3 replies in a row without a tool call, 3 fix rounds, 6,000 characters of tool output per result |
@@ -212,6 +218,8 @@ flowchart TB
     Controller -->|"on_pending, on_checkpoint"| Session["Session<br/>session.py"]
     Runner -->|"Ctrl+C, SIGTERM"| Cancel["CancelToken<br/>cancellation.py"]
     Cancel -.->|"breaks off waits,<br/>stops at safe points"| Controller
+    CLI -->|"resume: check_resume()"| Resume["Safe resume<br/>resume.py"]
+    Resume -->|"checkpoint, fingerprint"| Session
     Session -->|"session.json, lock"| SessionFiles[("workspace/runs/id/")]
     Controller -->|"initial_messages(), view()"| Context["ContextManager<br/>context.py"]
     Context -->|"repository map, outlines"| Navigator
@@ -221,12 +229,15 @@ flowchart TB
     Controller -->|"list, read, search, edit"| Tools["RepositoryTools<br/>repo_tools.py"]
     Controller -->|"find_symbol, outline,<br/>dependencies, git_status, git_diff"| Navigator["CodeNavigator<br/>navigation.py"]
     Navigator -->|"paths checked"| Tools
-    Controller -->|"run_check()"| Sandbox["DockerSandbox<br/>sandbox.py"]
+    Controller -->|"run_check()"| Baseline["BaselineSandbox<br/>baseline.py"]
+    Baseline -->|"lint: only new findings count"| Sandbox["DockerSandbox<br/>sandbox.py"]
     Tools --> Copy
     Sandbox -->|"docker create / start"| Container[["Docker container<br/>no network"]]
     Container --> Copy
+    CLI -->|"review: review_session()"| Runner
     Runner -->|"verify()"| Verification["Verification<br/>verification.py"]
-    Verification -->|"final checks"| Sandbox
+    Runner -->|"capture() at the start"| Baseline
+    Verification -->|"final checks"| Baseline
     Verification -->|"git diff, git status"| Copy
     Runner -->|"run.json, changes.diff"| Record[("run record")]
     CLI -->|"progress, checks, diff, result"| User
@@ -238,7 +249,7 @@ How the modules map to the handout's parts:
 |---|---|---|
 | Setup | `config.py`, `workspace.py` (`fetch`), `sandbox/Dockerfile` | settings and allowed projects, pinned clone per project, sandbox image |
 | Projects | `projects.py`, `config.py` | allowlist; selecting the project for a run; clone status; tasks per project |
-| Interface | `cli.py`, `__main__.py` | `projects`, `fetch`, `run` and `baseline` commands; progress, checks, diff and result |
+| Interface | `cli.py`, `__main__.py` | `projects`, `fetch`, `run`, `baseline`, `sessions`, `show`, `cancel`, `resume` and `review` commands; progress, checks, diff, unfinished work and result |
 | Controller | `controller.py`, `actions.py`, `prompts.py` | the agent loop; validation of every request; system prompt |
 | Model | `model.py`, `ollama_client.py` | model interface, scripted model for tests, Ollama client |
 | Repository tools | `repo_tools.py` | list, read, search and edit inside the run copy |
@@ -247,9 +258,10 @@ How the modules map to the handout's parts:
 | Task execution | `task_record.py`, `controller.py` | task record and step log; edit-test-fix loop at `finish`; per-task action limits |
 | Sessions | `session.py`, `cli.py` | checkpoint after every step; pending action; running or interrupted from the lock; `sessions` and `show` |
 | Cancellation | `cancellation.py`, `sandbox.py`, `cli.py` | Ctrl+C and `cancel` stop a run at a safe point; waits for the model or a check are broken off; containers removed; saved as cancelled |
+| Safe resume | `resume.py`, `runner.py`, `controller.py` | permissions, limits and working copy checked again; pause on mismatch or uncertain action; continue with the saved conversation, used limits and context state |
 | Execution | `sandbox.py` | configured checks in a locked-down container; output and exit codes |
 | Limits | `controller.py`, `output.py`, `ollama_client.py` | action, refusal and retry limits; output limits; context limit |
-| Verification | `verification.py`, `workspace.py`, `runner.py` | final checks, scope check, diff, run record |
+| Verification | `verification.py`, `baseline.py`, `workspace.py`, `runner.py` | final checks, lint judged against the starting code, build check, scope check, changed files, diff, unfinished work, `review`, run record |
 
 ```mermaid
 classDiagram
@@ -294,6 +306,12 @@ classDiagram
         +finish(verification)
         +status str
         +uncertain_action dict
+    }
+    class ResumeCheck {
+        +blocking list
+        +decisions list
+        +notes list
+        +can_resume(accept) bool
     }
     class CancelToken {
         +request(reason)
@@ -357,6 +375,7 @@ classDiagram
     AgentController ..> Session : on_pending, on_checkpoint
     SessionStore --> Session : finds and loads
     AgentController --> CancelToken : safe points
+    ResumeCheck ..> Session : checks before reopen()
     DockerSandbox ..> CheckResult : returns
     VerificationReport --> CheckResult : final checks
 ```
@@ -460,7 +479,8 @@ Every result and every error goes back to the model as a message, so it can reac
 - the starting commit, read from the run copy itself and compared with the pin;
 - the allowed changes (editable files);
 - the agent and final checks with the exact command of each, and the acceptance folder;
-- the limits that apply to this run.
+- the limits that apply to this run;
+- the baselines: findings of the baseline checks (`lint`) on the starting code, taken before the model starts.
 
 After every step, the record is saved again. Each save goes to a temporary file that then replaces the old one in one step (`os.replace`), so the file is always complete, also if the run is stopped unexpectedly. At the end, the harness adds the stop reason, the number of fix rounds and the final check results.
 
@@ -495,9 +515,13 @@ stateDiagram-v2
     verifying --> cancelled: Ctrl+C or cancel
     running --> interrupted: process gone (crash, kill -9)
     verifying --> interrupted: process gone
+    cancelled --> paused: resume finds a problem
+    interrupted --> paused: resume finds a problem
+    cancelled --> running: resume, all checks fine
+    interrupted --> running: resume, all checks fine
+    paused --> running: resume after fixing, or accepting
     passed --> [*]
     failed --> [*]
-    cancelled --> [*]
 ```
 
 **What is saved.** `session.json` is the checkpoint. It is written after every completed step and when the run stops, in the same safe way as the task record (temporary file, then `os.replace`). It holds:
@@ -558,6 +582,98 @@ So a cancel never leaves a half-written file. Once it is noted, no further actio
 
 **Finding the process.** `cancel` does not trust the process ID saved in `session.json`; a changed file could otherwise make it signal any process. It asks the Linux kernel which process holds the session's lock (`/proc/locks`) and signals only that one. It then waits until that process has released the lock, and shows the final status.
 
+## Safe resume
+
+`python -m harness resume <id>` continues a cancelled, interrupted or paused session from its last checkpoint. It never continues blindly. First it checks everything again (`check_resume()` in `resume.py`) and prints the result:
+
+```text
+== Checks before resuming
+  ok       session is cancelled and not in use
+  ok       project cosmicpython is allowed, same commit 14c84797ffa7
+  ok       task unchanged: request, allowed changes, checks, acceptance folder
+  ok       limits unchanged; 28 actions and 3 fix rounds left
+  ok       working copy matches the checkpoint (1 changed file(s), including the harness's own edits)
+```
+
+| Checked again | Problem | What happens |
+|---|---|---|
+| Session | passed, failed, or in use by another process | blocked |
+| Project | no longer allowed, or another URL or commit | blocked |
+| Task | the request, allowed changes, agent or final checks, a check's command, or the acceptance folder changed | blocked: restore the task file |
+| Limits | changed since the start, or already used up | blocked |
+| Working copy | another commit, or a changed file whose SHA-256 hash differs from the checkpoint: edited outside the harness, a harness edit undone, a new change | paused until the user accepts it |
+| Uncertain action | an edit, check, finish check or verification was cut off | paused until the user accepts it; never repeated |
+
+**Blocking problems** are about permissions and rules: resuming would mean running under other permissions than the run started with. Nothing overrides them.
+
+**The other two need a person's judgment.** Only the user can tell whether a changed file is intended. After looking at it, the user can resume with `--accept-current-state`. An uncertain action that only reads (read, search, navigation) cannot have changed anything, so it does not pause; its result is just lost.
+
+On any problem that is not accepted, the session is saved as **paused**, with the reasons (`show` lists them), and nothing runs: no model request, no check. The original reason for the stop stays known (`paused_from`). `resume` exits with code 3.
+
+**Continuing.** The run goes on with:
+- the saved conversation;
+- the used limits (2 of 30 actions used means 28 are left);
+- the continued step numbers;
+- the same context state (the same marker code and shortened results).
+
+If the model's last reply has calls without a result, each gets one: "Interrupted: the run stopped while this call ran" for the call that was cut off, and "Not run" for any later ones. So the conversation stays complete. Then a trusted note from the harness says why the run stopped, which limits are left, which action was cut off and **not repeated**, and, if accepted, which files differ from the checkpoint. The model decides what to check or redo.
+
+If the run had already finished its agent loop and was cancelled during the final verification, `resume` runs only the verification. The session keeps a log of every resume (when, from which status, what was accepted). The task record keeps earlier results.
+
+## Verification and review
+
+After the agent loop, the harness verifies the result itself (`verify()` in `verification.py`). The model's own claim never counts. The report shows:
+
+- **changed files**, from `git status` of the run copy;
+- the **diff**, from `git diff`;
+- the **final checks**: each one passed, failed, timed out or unavailable, with its output. For `batch_expiry` these are the hidden acceptance tests, the unit tests, the SQLite integration tests, `lint` and `build`;
+- the **scope check**: only the task's editable files changed;
+- **unfinished work**: what is still open (see below).
+
+**Lint, judged against the starting code.** `lint` runs `pyflakes` (pinned in the sandbox image). Cosmic Python's starting code already has 7 pyflakes warnings (unused imports), so plain pyflakes fails for every solution, even a perfect one. So `lint` is a *baseline check* (`baseline_checks = ["lint"]` in the config):
+
+```mermaid
+flowchart TB
+    Start(["run starts"]) --> Capture["Harness runs lint once<br/>on the fresh copy"]
+    Capture -->|"could not run"| None["baseline: none"]
+    Capture -->|"findings"| Saved[("task.json: baselines<br/>file: message, no line numbers")]
+    Later(["lint later: by the model,<br/>at finish, in verification, in review"]) --> Run["pyflakes in the sandbox"]
+    Run -->|"error or timeout"| Unavail["unavailable"]
+    Run --> Compare{"findings now<br/>minus baseline"}
+    Saved --> Compare
+    None --> Unavail
+    Compare -->|"nothing new"| Pass["passed<br/>'7 before, 7 now, 0 new'"]
+    Compare -->|"new findings"| Fail["failed<br/>new findings listed first"]
+```
+
+- A finding is its file and message, without the line number, because edits move lines. Findings are counted, so a second copy of an old warning in the same file is new.
+- A fixed old warning is fine ("7 before, 6 now, 0 new").
+- Without a baseline, `lint` is **unavailable**, never passed by default.
+- `BaselineSandbox` in `baseline.py` wraps the sandbox, so the model's `run_check`, the checks at `finish`, verification and `review` all judge lint the same way. Other checks pass through unchanged.
+
+`lint` is an agent check and a final check of `batch_expiry`. It is a *gate*: a new warning (for example an import the agent added but no longer uses) fails the checks at `finish`, so the agent gets a fix round to remove it, and it fails the final result if it stays. The Stage 1 task is unchanged.
+
+**Build.** `build` compiles every module under `src/` (`python -m compileall`). It catches syntax errors in files no test imports. `PYTHONPYCACHEPREFIX=/tmp/pycache` writes the compiled files to `/tmp` inside the container instead of `__pycache__` folders next to the code, so the check leaves no new files in the copy (they would show up in `git status` and the scope check).
+
+**Unfinished work.** `run`, `resume`, `show` and `review` end with an "Unfinished work" section, built only from the harness's own records:
+
+```text
+== Unfinished work
+  - The run was cancelled (Ctrl+C).
+  - Step 13 (edit_file src/allocation/domain/model.py) was cut off; it is not known whether it completed.
+  - No final verification has run on the current state (python -m harness review <id> runs it).
+```
+
+It lists: a cancel, a stop for another reason than "finished" (such as the action limit), a stop without a normal end (process gone), an action that was cut off, missing verification, every final check that did not pass (with its last line, e.g. "7 before, 8 now, 1 new"), and files changed outside the allowed ones. A clean run shows "(none)".
+
+**Review.** `python -m harness review <id>` runs the final checks again on a stopped session's working copy, and shows changed files, the diff, the checks and the unfinished work.
+
+- It is useful after a cancel (where does the work stand?), after editing the copy by hand, or to check a finished run again.
+- It never changes the session's status. It is logged in the session (`show` lists reviews), and "Unfinished work" in `show` then follows the latest review, until a resume starts a new part of the session.
+- It checks under the same rules as the run: the project must still be allowed with the same commit, and the task (request, allowed changes, checks and their commands, acceptance folder) must be unchanged, as for `resume`. It uses the baseline saved at the start.
+- It holds the session lock, so it refuses a running session or one in use by a resume.
+- Exit code `0` when everything passes, `1` otherwise.
+
 ## Protecting the working environment
 
 ```mermaid
@@ -600,7 +716,7 @@ flowchart LR
 pytest
 ```
 
-All 254 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests and 1 cancellation test that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Six tests need more. Four need the pristine clone: the reference patch applies, navigation finds what the feature needs, file selection picks the editable files of both tasks, and the scripted feature run's edits fit the real code. Two need the pristine clone, Docker and the `cosmic-sandbox` image: the real reference check, and the real scripted feature run. They are skipped otherwise.
+All 306 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests and 1 cancellation test that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Six tests need more. Four need the pristine clone: the reference patch applies, navigation finds what the feature needs, file selection picks the editable files of both tasks, and the scripted feature run's edits fit the real code. Two need the pristine clone, Docker and the `cosmic-sandbox` image: the real reference check, and the real scripted feature run. They are skipped otherwise.
 
 | Handout test | Where |
 |---|---|
@@ -615,9 +731,11 @@ All 254 tests run without a model, an account or an API key. The controller test
 | Task execution | `test_task_execution.py`: the task record holds request, starting commit, allowed changes, checks and limits; steps are on disk before the next model request; the record can be reopened after the run |
 | Session storage | `test_sessions.py`: a full run (refused request, failing check, fix, passing finish) is reopened with task details, steps, history, errors, check results, used limits and fingerprint; a separate Python process shows it with `show --history`; a harness process killed with `SIGKILL` during a check leaves an interrupted session with that check marked uncertain and the harness's own edit in the fingerprint; Ctrl+C does the same; a session in use shows as running and cannot be opened twice; IDs are found by unique parts, unsafe or ambiguous ones are refused |
 | Cancellation | `test_cancellation.py`: during a command, across processes, a stuck check in a separate harness process is stopped by `python -m harness cancel`; the check's whole process group is gone, the edit before it stays, the model's next edit never runs, and the session is cancelled with the check uncertain (a fake `docker` stands in, and with Docker present a real container is tested too). During a model request, the run stops within seconds instead of waiting. Ctrl+C between steps lets the current step finish and runs nothing more. A cancel during final verification is saved; second requests stop at once; `cancel` uses the kernel's lock holder, not the saved process ID |
+| Safe resume | `test_resume.py`: a cancelled run resumes from its checkpoint with the harness's own edit, continued step numbers and used limits (2 of 3 actions used allows one more); a file changed outside, or a harness edit undone, pauses with nothing run, and `--accept-current-state` continues and tells the model; a changed request, allowed changes, checks, check command, limit, or a project no longer allowed blocks even with acceptance, as do used-up limits; a cut-off check pauses and is never repeated; calls without a result get one; a cut-off read does not pause; a harness process killed during a check is resumed after acceptance; a cancel during verification resumes with verification only; the CLI shows the checks and exits with 3 |
 | Checks and loop | `test_task_execution.py`: scripted replies call `finish` too early, get the failing check output and a fix-round note, fix the code and finish; checks that never pass stop after the last fix round; unavailable checks stop at once and the run is never PASSED; `test_feature_task.py`: the scripted feature run needs exactly one fix round on the real code |
 | Bug fix | `test_runner.py`: with a fake sandbox in place of Docker, the acceptance check fails on the starting code and passes after the change, and existing tests still pass. The real check is shown by `baseline` and `run` (see Results) |
-| Feature | `test_feature_task.py`: the reference patch changes exactly the task's editable files and applies to the starting commit; with Docker, the real acceptance check fails on the starting code for the expected reason, passes with the reference solution, and the regression checks pass both times |
+| Verification extras | `test_verification_extras.py`: findings ignore line numbers; the starting findings alone pass while pyflakes itself exits 1; a new finding fails and is listed first; moved lines are not new, a second copy is; without a baseline lint is unavailable; a run saves the baseline before the model starts, a new lint warning fails `finish` and is fixed in a fix round, one left in fails the run; unfinished work for each case; `review` of a cancelled session passes without changing its status, is logged, and is no longer current after a resume; `review` refuses a running session, a session in use, and a changed task; the CLI's `review` exit codes and output, and `show` judged by the latest review |
+| Feature | `test_feature_task.py`: the reference patch changes exactly the task's editable files and applies to the starting commit; with Docker, the real acceptance check fails on the starting code for the expected reason, passes with the reference solution (lint: "7 before, 7 now, 0 new"), and the regression checks pass both times |
 
 `test_projects.py` covers the allowlist: unknown or mismatched projects are refused before anything runs, pristine folders outside `workspace/` are refused, each project gets its own image and checks, and `fetch` (from a local repository) creates, keeps, repairs and cleans up clones.
 
@@ -627,7 +745,8 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ## Limitations and observations
 
-- One allowed project so far. The config and the commands support several, and the tests use a second, made-up project. Navigation, context management and sessions are still to come in Stage 2.
+- One allowed project so far. The config and the commands support several, and the tests use a second, made-up project.
+- Lint findings are matched by file and message. If the agent fixes an old warning and adds an identical one in the same file, the count stays the same and it is not seen as new. pyflakes finds errors such as unused imports and undefined names; it does not check style.
 - Sessions rely on `flock`, so they need Linux or WSL (as the whole harness does), and a session is seen as running only on the computer that runs it.
 - The history summary is mechanical: it lists what shortened steps did, not what the model learned from them. A result that was shortened has to be fetched again if it is needed. Token counts are estimated (3 characters per token), not counted by the model's tokenizer.
 - File selection uses names and words, not meaning: a task that describes behavior in words that appear in no file name or symbol gets fewer useful selections. Editable files always rank high.
@@ -640,7 +759,7 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                254 automated tests
+tests/                306 automated tests
 acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
 tasks/                task files: invalid_quantity (Stage 1), batch_expiry (Stage 2)
 reference/            hand-written reference solutions, one patch per task, never shown to the agent

@@ -3,7 +3,7 @@
 A session is a run folder (workspace/runs/<id>/). Next to the task record
 (task.json) it holds session.json, the checkpoint:
 
-  status            running, verifying, passed, failed or cancelled (as saved)
+  status            running, verifying, passed, failed, cancelled or paused (as saved)
   counters          actions, refused actions, retries, fix rounds, steps:
                     the limits already used
   pending_action    the step that has started but not finished, or null
@@ -36,6 +36,7 @@ import re
 import signal
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,7 @@ VERIFYING = "verifying"  # the harness is running the final checks
 PASSED = "passed"  # over: all final checks passed
 FAILED = "failed"  # over: at least one final check failed or could not run
 CANCELLED = "cancelled"  # stopped on request (Ctrl+C or cancel); no verification ran
+PAUSED = "paused"  # a resume found problems; see pause_reasons
 # Shown (never saved) for a running or verifying session whose process is gone
 INTERRUPTED = "interrupted"
 
@@ -107,6 +109,8 @@ class Session:
             "pending_action": None,
             "interrupted_action": None,
             "cancel_reason": None,
+            "pause_reasons": None,
+            "resumes": [],
             "context": None,
             "messages": [],
             "events": [],
@@ -191,6 +195,81 @@ class Session:
         self.save()
         self.close()
 
+    def pause(self, reasons: list[str]) -> None:
+        """Save the session as paused, with the reasons. Nothing runs."""
+        # Read before taking the lock: while this process holds it, the session
+        # looks running, and an interrupted session would lose its status.
+        uncertain, status = self.uncertain_action, self.status
+        with self.hold():
+            if status != PAUSED:
+                self.data["paused_from"] = status  # why the run stopped in the first place
+            self.data.update({"status": PAUSED, "pause_reasons": reasons, "updated_at": now(),
+                              "pending_action": None, "interrupted_action": uncertain})
+            self.save()
+
+    def reopen(self, accepted: list[str], model_name: str) -> None:
+        """Take the session over to continue it. Keeps the lock until finish/close.
+
+        accepted lists what the user explicitly accepted (with --accept-current-state);
+        it is kept in the session's resume log.
+        """
+        # Read before taking the lock (see pause()).
+        status, uncertain = self.status, self.uncertain_action
+        lock_fd = _try_lock(self.run_dir / LOCK_FILE, create=True)
+        if lock_fd is None:
+            raise SessionError(f"Session {self.session_id} is in use by another process.")
+        self._lock_fd = lock_fd
+        self.data.setdefault("resumes", []).append({
+            "at": now(), "from_status": status, "paused_from": self.data.get("paused_from"),
+            "model": model_name, "accepted": accepted, "uncertain_action": uncertain,
+        })
+        self.data.update({"status": RUNNING, "pid": os.getpid(), "updated_at": now(),
+                          "paused_from": None,
+                          "pending_action": None, "interrupted_action": None,
+                          "cancel_reason": None, "pause_reasons": None, "verification": None,
+                          "model": model_name})
+        self.save()
+
+    @contextmanager
+    def hold(self):
+        """Hold the session lock for a short write, if no one else holds it."""
+        if self._lock_fd is not None:
+            yield  # this process already holds it
+            return
+        fd = _try_lock(self.run_dir / LOCK_FILE, create=True)
+        if fd is None:
+            raise SessionError(f"Session {self.session_id} is in use by another process.")
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def add_review(self, verification) -> None:
+        """Log a review: the final checks run again on the current working copy.
+
+        The session's status stays as it is; a review only looks.
+        """
+        from harness.verification import check_summaries  # verification is a leaf module
+        self.data.setdefault("reviews", []).append({
+            "at": now(), "passed": verification.passed,
+            "checks": check_summaries(verification),  # name, status, one-line detail
+            "scope_passed": verification.scope.passed,
+            "outside": verification.scope.outside,
+            "changed_files": verification.changed_files,
+            # Which part of the session it reviewed: a resume after it starts a new one.
+            "after_resumes": len(self.data.get("resumes", [])),
+        })
+        self.save()
+
+    @property
+    def current_review(self) -> dict | None:
+        """The latest review, if nothing changed the session after it (e.g. a resume)."""
+        reviews = self.data.get("reviews") or []
+        if reviews and reviews[-1]["after_resumes"] == len(self.data.get("resumes", [])):
+            return reviews[-1]
+        return None
+
     def save(self) -> None:
         write_json_atomic(self.run_dir / SESSION_FILE, self.data)
 
@@ -234,7 +313,7 @@ class Session:
         status = self.status
         if status == INTERRUPTED:
             return self.data.get("pending_action")
-        if status == CANCELLED:
+        if status in (CANCELLED, PAUSED):
             return self.data.get("interrupted_action")
         return None
 

@@ -39,7 +39,7 @@ def test_feature_task_loads_and_its_checks_exist():
     task = load_task(TASK_PATH)
     check_task(task, PROJECT)  # no error
     assert task.acceptance_dir == (ACCEPTANCE_ROOT / "batch_expiry").resolve()
-    assert task.final_checks == ["acceptance", "unit_tests", "integration_sqlite"]
+    assert task.final_checks == ["acceptance", "unit_tests", "integration_sqlite", "lint", "build"]
 
 
 def test_acceptance_check_stays_hidden_from_the_agent():
@@ -216,7 +216,9 @@ def test_real_acceptance_fails_on_starting_code_and_passes_with_reference(tmp_pa
     assert before["unit_tests"].passed
     assert before["integration_sqlite"].passed
 
-    assert [c.status for c in result.after.checks] == ["passed", "passed", "passed"]
+    assert [c.status for c in result.after.checks] == ["passed"] * 5
+    lint = {c.name: c for c in result.after.checks}["lint"]
+    assert lint.output.splitlines()[-1].endswith("0 new (compared with the starting code)")
     assert result.after.scope.passed
     assert result.ok
 

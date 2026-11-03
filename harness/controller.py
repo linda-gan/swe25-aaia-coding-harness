@@ -68,7 +68,7 @@ INTERNAL_ERROR = "internal error"
 @dataclass(frozen=True)
 class Event:
     """One line of progress, for the interface to show and for the run log."""
-    kind: str  # thinking, model, action, result, refused, retry, finish, check, context, stop
+    kind: str  # thinking, model, action, result, refused, retry, finish, check, context, resume, stop
     message: str
     elapsed_seconds: float = 0.0  # since the agent run started
 
@@ -135,10 +135,30 @@ class AgentController:
     # ---- the loop ----------------------------------------------------------
 
     def run(self) -> RunResult:
+        """A new run: first messages, then the loop."""
         self._start = time.monotonic()
         self.context = ContextManager(self.task, self.navigator, self.context_config, self.schemas,
                                       fix_rounds=self.limits.max_fix_rounds)
         run = RunResult(stop_reason="", messages=self.context.initial_messages())
+        return self._guarded_loop(run)
+
+    def resume(self, run: RunResult, context_state: dict) -> RunResult:
+        """Continue a saved run: its messages and used limits, and the saved context state.
+
+        The caller has checked that resuming is safe (see harness/resume.py) and
+        added the harness's resume note to run.messages.
+        """
+        self._start = time.monotonic()
+        self.context = ContextManager.restore(self.task, self.navigator, self.context_config,
+                                              self.schemas, context_state,
+                                              fix_rounds=self.limits.max_fix_rounds)
+        run.stop_reason, run.stop_detail, run.interrupted_action = "", "", None
+        self._emit(run, "resume", f"Resumed at step {run.steps + 1}: {run.actions} of "
+                                  f"{self.limits.max_actions} actions and {run.fix_rounds} of "
+                                  f"{self.limits.max_fix_rounds} fix rounds already used")
+        return self._guarded_loop(run)
+
+    def _guarded_loop(self, run: RunResult) -> RunResult:
         try:
             return self._loop(run)
         except Cancelled as exc:

@@ -12,7 +12,8 @@ def test_loads_sandbox_settings_and_checks():
     project = load_config().project("cosmicpython")
     assert project.sandbox.image == "cosmic-sandbox"
     assert project.sandbox.timeout_seconds > 0
-    assert set(project.checks) == {"unit_tests", "acceptance", "integration_sqlite"}
+    assert set(project.checks) == {"unit_tests", "acceptance", "integration_sqlite", "lint", "build"}
+    assert project.baseline_checks == ("lint",)
     assert project.checks["unit_tests"][0] == "pytest"
 
 

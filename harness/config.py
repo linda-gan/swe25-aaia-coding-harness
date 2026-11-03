@@ -71,6 +71,8 @@ class ProjectConfig:
     pristine: Path  # absolute path of the clean clone, inside workspace/
     sandbox: SandboxConfig  # this project's image plus the shared resources
     checks: dict[str, list[str]]  # the only commands that may run, by name
+    # Checks judged against the starting code: only new findings count (see baseline.py).
+    baseline_checks: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -178,7 +180,7 @@ def _build_project(name: str, values: dict, resources: dict, workspace_dir: Path
     where = f"[projects.{name}]"
     if not FOLDER_NAME.fullmatch(name):
         raise ValueError(f"{where}: a project name may only use letters, digits, '_' and '-'.")
-    unknown = set(values) - {"url", "commit", "pristine", "image", "checks"}
+    unknown = set(values) - {"url", "commit", "pristine", "image", "checks", "baseline_checks"}
     if unknown:
         raise ValueError(f"{where}: unknown setting(s) {', '.join(sorted(unknown))}.")
 
@@ -196,6 +198,10 @@ def _build_project(name: str, values: dict, resources: dict, workspace_dir: Path
         if not isinstance(argv, list) or not argv or not all(isinstance(p, str) for p in argv):
             raise ValueError(f"{where}: check {check!r} must be a non-empty list of strings.")
 
+    baseline_checks = values.get("baseline_checks", [])
+    if not isinstance(baseline_checks, list) or any(c not in checks for c in baseline_checks):
+        raise ValueError(f"{where}: baseline_checks must list names from its checks.")
+
     return ProjectConfig(
         name=name,
         url=url,
@@ -203,6 +209,7 @@ def _build_project(name: str, values: dict, resources: dict, workspace_dir: Path
         pristine=_pristine_dir(where, values["pristine"], workspace_dir),
         sandbox=SandboxConfig(image=image, **resources),
         checks=dict(checks),
+        baseline_checks=tuple(baseline_checks),
     )
 
 

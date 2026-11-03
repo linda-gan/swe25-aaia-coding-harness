@@ -13,6 +13,7 @@ Contents:
   checks            agent checks, final checks, and the exact command of each
   acceptance_tests  the task's acceptance folder (mounted read-only)
   limits            the limits that apply to this run
+  baselines         findings of baseline checks (e.g. lint) on the starting code
   steps             one entry per action or finish attempt (see controller._step)
   result            stop reason, fix rounds and verification, added at the end
 """
@@ -90,6 +91,18 @@ class TaskRecord:
     def add_step(self, step: dict) -> None:
         """Append one step and save at once."""
         self.data["steps"].append(dict(step))
+        self.save()
+
+    def set_baselines(self, baselines: dict) -> None:
+        """Findings of the baseline checks on the starting code (see baseline.py)."""
+        self.data["baselines"] = baselines
+        self.save()
+
+    def reopen(self) -> None:
+        """A resumed run: running again; an earlier result is kept in the history."""
+        if self.data.get("result"):
+            self.data.setdefault("earlier_results", []).append(self.data["result"])
+        self.data.update({"status": "running", "result": None})
         self.save()
 
     def finish(self, stop_reason: str, fix_rounds: int, passed: bool | None,

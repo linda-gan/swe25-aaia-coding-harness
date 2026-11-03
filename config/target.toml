@@ -7,6 +7,8 @@ url = "https://github.com/cosmicpython/code.git"
 commit = "14c84797ffa77255d53cf1a02fe6aafda2b68aeb"   # exact starting commit
 pristine = "workspace/target-pristine"   # clean clone: python -m harness fetch cosmicpython
 image = "cosmic-sandbox"                 # sandbox image with this project's dependencies
+# Checks whose findings are compared with the starting code: only new ones count.
+baseline_checks = ["lint"]
 
 # The only commands that can run in this project's sandbox, by name.
 [projects.cosmicpython.checks]
@@ -24,6 +26,14 @@ integration_sqlite = [
     "-q", "-p", "no:cacheprovider",
     "-k", "not test_concurrent_updates_to_version_are_not_allowed",
 ]
+# Lint with pyflakes. The starting code already has 7 warnings (unused imports),
+# so this check is judged against the starting code: only new warnings count
+# (see baseline_checks above and harness/baseline.py).
+lint = ["python", "-m", "pyflakes", "src"]
+# Build check: every source file must compile, also files no test imports.
+# PYTHONPYCACHEPREFIX sends the .pyc files to /tmp, so nothing is written
+# into the working copy.
+build = ["env", "PYTHONPYCACHEPREFIX=/tmp/pycache", "python", "-m", "compileall", "-q", "src"]
 
 # ---- Shared by all projects -----------------------------------------------
 

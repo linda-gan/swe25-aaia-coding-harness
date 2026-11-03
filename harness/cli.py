@@ -8,11 +8,13 @@ the core modules (runner, projects, workspace).
     python -m harness sessions                             saved sessions and their status
     python -m harness show <session id>                    one session in detail
     python -m harness cancel <session id>                  stop a running session
+    python -m harness resume <session id>                  continue a stopped session safely
+    python -m harness review <session id>                  run the final checks again on it
 
 run and baseline take --project NAME; it must be allowed and match the task.
 
 Exit codes: 0 all checks passed, 1 checks failed, 2 setup problem,
-130 interrupted with Ctrl+C.
+3 resume paused (see the reasons), 130 cancelled (Ctrl+C or cancel).
 """
 from __future__ import annotations
 
@@ -26,12 +28,20 @@ from harness.config import PROJECT_ROOT, HarnessConfig, load_config, load_task
 from harness.controller import Event, RunResult
 from harness.ollama_client import OllamaClient
 from harness.projects import TaskEntry, list_tasks, pristine_status, select_project
-from harness.runner import RunReport, check_task, effective_limits, make_sandbox, run_task
-from harness.session import CANCELLED, INTERRUPTED, Session, SessionError, SessionStore
-from harness.verification import VerificationReport, verify
+from harness.baseline import BaselineSandbox
+from harness.cancellation import Cancelled
+from harness.resume import ResumeCheck
+from harness.runner import (
+    RunReport, capture_baselines, check_task, effective_limits, make_sandbox, resume_task,
+    review_session, run_task,
+)
+from harness.session import (
+    CANCELLED, INTERRUPTED, PAUSED, RUNNING, VERIFYING, Session, SessionError, SessionStore,
+)
+from harness.verification import VerificationReport, check_summaries, unfinished_work, verify
 from harness.workspace import RUNS_DIR, WorkspaceError, create_project_copy, fetch_project
 
-EXIT_PASSED, EXIT_FAILED, EXIT_SETUP, EXIT_INTERRUPTED = 0, 1, 2, 130
+EXIT_PASSED, EXIT_FAILED, EXIT_SETUP, EXIT_PAUSED, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 
 
 # ---- colors ------------------------------------------------------------------
@@ -190,7 +200,7 @@ def format_projects(style: Style, config: HarnessConfig, statuses: dict[str, str
 
 
 STATUS_COLORS = {"passed": "green", "failed": "red", INTERRUPTED: "yellow",
-                 CANCELLED: "yellow", "running": "cyan", "verifying": "cyan"}
+                 CANCELLED: "yellow", PAUSED: "yellow", "running": "cyan", "verifying": "cyan"}
 
 
 def color_status(style: Style, status: str, width: int = 0) -> str:
@@ -237,6 +247,13 @@ def format_session(style: Style, session: Session, history: bool = False) -> str
     lines.append(f"  Status:   {color_status(style, status)}")
     if data.get("cancel_reason") and status == CANCELLED:
         lines.append(f"  Cancelled by: {data['cancel_reason']}")
+    if status == PAUSED and data.get("pause_reasons"):
+        lines.append(style.yellow("  Paused, because:"))
+        lines.extend(style.yellow(f"    - {reason}") for reason in data["pause_reasons"])
+    if data.get("resumes"):
+        for entry in data["resumes"]:
+            accepted = f"; accepted: {len(entry['accepted'])} item(s)" if entry["accepted"] else ""
+            lines.append(f"  Resumed:  {entry['at']} from {entry['from_status']}{accepted}")
     if session.uncertain_action:
         lines.append(style.yellow(
             f"  Uncertain action: {describe_pending(session.uncertain_action)}. The run stopped "
@@ -321,6 +338,19 @@ def format_session(style: Style, session: Session, history: bool = False) -> str
         lines.append("  not run" + {INTERRUPTED: " (the session was interrupted)",
                                      CANCELLED: " (the session was cancelled)"}.get(status, " yet"))
 
+    if data.get("reviews"):
+        lines.append(heading(style, "Reviews (final checks run again later)"))
+        for review in data["reviews"]:
+            summary = ", ".join(f"{c['name']} {c['status']}" for c in review["checks"])
+            result = style.green("PASSED") if review["passed"] else style.red("FAILED")
+            lines.append(f"  {review['at']}  {result}  ({summary})")
+        if session.current_review is None:
+            lines.append("  The session changed after the latest review (it was resumed).")
+
+    lines.append(format_unfinished(style, session_unfinished(session)))
+    if session.current_review is not None:
+        lines.append(f"  (judged by the latest review, {session.current_review['at']})")
+
     lines.append(heading(style, "History"))
     messages = data["messages"]
     lines.append(f"  {len(messages)} messages saved"
@@ -333,6 +363,87 @@ def format_session(style: Style, session: Session, history: bool = False) -> str
                 text += " -> " + ", ".join(c["function"]["name"] for c in message["tool_calls"])
             lines.append(f"  {i:>3} {who:<16} {text[:150]}")
     return "\n".join(lines)
+
+
+def format_resume_check(style: Style, check: ResumeCheck, accept: bool) -> str:
+    lines = [heading(style, "Checks before resuming")]
+    lines.extend(style.green(f"  ok       {item}") for item in check.passed)
+    lines.extend(style.red(f"  BLOCKED  {item}") for item in check.blocking)
+    label = "ACCEPTED" if accept else "DECIDE  "
+    lines.extend(style.yellow(f"  {label} {item}") for item in check.decisions)
+    lines.extend(f"  note     {item}" for item in check.notes)
+    return "\n".join(lines)
+
+
+def format_unfinished(style: Style, items: list[str]) -> str:
+    lines = [heading(style, "Unfinished work")]
+    if items:
+        lines.extend(style.yellow(f"  - {item}") for item in items)
+    else:
+        lines.append("  (none: the agent finished, and every final check and the scope "
+                     "check passed)")
+    return "\n".join(lines)
+
+
+def report_unfinished(report: RunReport) -> list[str]:
+    verification = report.verification
+    return unfinished_work(
+        report.agent.stop_reason, report.agent.stop_detail, report.agent.interrupted_action,
+        check_summaries(verification) if verification else None,
+        verification.scope.outside if verification else [])
+
+
+def session_unfinished(session: Session, verification: VerificationReport | None = None) -> list[str]:
+    """Unfinished work of a saved session, judged by the newest check results:
+    a review running now (verification), else the latest review if it is still
+    current, else the final verification of the run."""
+    data, status = session.data, session.status
+    if status in (RUNNING, VERIFYING):
+        return ["The session is still running; what is unfinished is known once it stops."]
+    stopped_as = data.get("paused_from") if status == PAUSED else status
+    if stopped_as == CANCELLED:
+        reason, detail = "cancelled", data.get("cancel_reason") or ""
+    elif stopped_as in (INTERRUPTED, PAUSED, None):
+        reason, detail = "", ""
+    else:
+        reason, detail = data.get("stop_reason") or "", data.get("stop_detail") or ""
+    review = session.current_review
+    if verification is not None:
+        checks, outside = check_summaries(verification), verification.scope.outside
+    elif review is not None:
+        checks, outside = review["checks"], review["outside"]
+    elif data.get("verification"):
+        saved = data["verification"]
+        checks = [{"name": c["name"], "status": c["status"],
+                   "detail": c["error"] or last_line(c["output_tail"])} for c in saved["checks"]]
+        outside = saved["scope"]["outside"]
+    else:
+        checks, outside = None, []
+    items = unfinished_work(reason, detail, session.uncertain_action, checks, outside)
+    if status == PAUSED:
+        items.insert(0, "The session is paused; see the reasons above.")
+    return items
+
+
+def print_run_outcome(style: Style, report: RunReport, session_id: str) -> int:
+    """The end of a run or a resumed run: agent, verification, result."""
+    print()
+    print(format_agent(style, report.agent))
+    if report.cancelled:
+        print(style.yellow(f"Cancelled ({report.agent.stop_detail}). No further actions ran, "
+                           "and no verification was run."))
+        if report.agent.interrupted_action:
+            print(style.yellow("Uncertain action: "
+                               f"{describe_pending(report.agent.interrupted_action)}"))
+        print(format_unfinished(style, report_unfinished(report)))
+        print(f"Session: python -m harness show {session_id}")
+        return EXIT_INTERRUPTED
+    print(format_verification(style, report.verification))
+    print(format_unfinished(style, report_unfinished(report)))
+    print()
+    print(format_result(style, report))
+    print(f"Session: python -m harness show {session_id}")
+    return EXIT_PASSED if report.passed else EXIT_FAILED
 
 
 # ---- commands ----------------------------------------------------------------
@@ -373,6 +484,70 @@ def cmd_cancel(args, style: Style) -> int:
         print(style.yellow(f"Uncertain action: {describe_pending(session.uncertain_action)}"))
     print(f"Details: python -m harness show {session.session_id}")
     return EXIT_PASSED
+
+
+def cmd_resume(args, style: Style) -> int:
+    config = load_config()
+    session = SessionStore(args.runs_dir).open(args.session)
+    model_config = config.model
+    if args.model:
+        model_config = dataclasses.replace(model_config, name=args.model)
+    if args.no_think:
+        model_config = dataclasses.replace(model_config, think=False)
+    print(style.bold(f"Resuming session {session.session_id}"))
+    print(f"  Status:  {color_status(style, session.status)}")
+    print(f"  Task:    {shown_path(session.data['task_file'])}")
+    print(f"  Model:   {model_config.name} (thinking {'on' if model_config.think else 'off'})")
+
+    def show_check(check: ResumeCheck) -> None:
+        print(format_resume_check(style, check, args.accept_current_state))
+        if check.can_resume(args.accept_current_state):
+            print(heading(style, "Agent (continued)"))
+
+    try:
+        outcome = resume_task(
+            session, config, OllamaClient(model_config), model_config.name,
+            accept_current_state=args.accept_current_state,
+            on_event=lambda e: print(format_event(style, e), flush=True),
+            on_check=show_check,
+        )
+    except KeyboardInterrupt:
+        print(style.yellow(f"\nThe session is saved: python -m harness show {session.session_id}"),
+              file=sys.stderr)
+        raise
+    if outcome.report is None:
+        print()
+        print(style.yellow(f"Not resumed. The session is {Session.load(session.run_dir).status}."))
+        if outcome.check.blocking:
+            print("Fix the BLOCKED items first; they cannot be overridden.")
+        elif outcome.check.decisions:
+            print("If the current state is what you want, resume with --accept-current-state. "
+                  "The uncertain action will not be repeated; the model is told about it.")
+        print(f"Details: python -m harness show {session.session_id}")
+        return EXIT_PAUSED
+    return print_run_outcome(style, outcome.report, session.session_id)
+
+
+def cmd_review(args, style: Style) -> int:
+    config = load_config()
+    session = SessionStore(args.runs_dir).open(args.session)
+    print(style.bold(f"Review of session {session.session_id}"))
+    print(f"  Status:  {color_status(style, session.status)} (a review does not change it)")
+    print(f"  Task:    {shown_path(session.data['task_file'])}")
+    print(f"  Copy:    {session.data['repo']}")
+    print("  The final checks run again on the working copy as it is now.")
+    try:
+        verification = review_session(session, config)
+    except Cancelled:
+        print(style.yellow("Review cancelled; nothing was logged, and the session is unchanged."))
+        return EXIT_INTERRUPTED
+    print(format_verification(style, verification))
+    print(format_unfinished(style, session_unfinished(session, verification)))
+    print()
+    print(style.bold(style.green("REVIEW: PASSED - all final checks pass on the current state.")
+                     if verification.passed else
+                     style.red("REVIEW: FAILED - see the checks above.")))
+    return EXIT_PASSED if verification.passed else EXIT_FAILED
 
 
 def cmd_projects(args, style: Style) -> int:
@@ -420,21 +595,7 @@ def cmd_run(args, style: Style) -> int:
         print(style.yellow(f"\nThe session is saved and shows as interrupted: "
                            f"python -m harness show {run_copy.run_id}"), file=sys.stderr)
         raise
-    print()
-    print(format_agent(style, report.agent))
-    if report.cancelled:
-        print(style.yellow(f"Cancelled ({report.agent.stop_detail}). No further actions ran, "
-                           "and no verification was run."))
-        if report.agent.interrupted_action:
-            print(style.yellow("Uncertain action: "
-                               f"{describe_pending(report.agent.interrupted_action)}"))
-        print(f"Session: python -m harness show {run_copy.run_id}")
-        return EXIT_INTERRUPTED
-    print(format_verification(style, report.verification))
-    print()
-    print(format_result(style, report))
-    print(f"Session: python -m harness show {run_copy.run_id}")
-    return EXIT_PASSED if report.passed else EXIT_FAILED
+    return print_run_outcome(style, report, run_copy.run_id)
 
 
 def run_with_progress(args, style, config, task, project, model_config, run_copy) -> RunReport:
@@ -457,7 +618,9 @@ def cmd_baseline(args, style: Style) -> int:
     print(style.bold("Baseline: final checks on the unchanged starting code"))
     print(f"  Project: {project.name} ({project.url} @ {project.commit[:12]})")
     print(f"  Copy:    {run_copy.repo}")
-    report = verify(make_sandbox(run_copy, project, task), run_copy.repo, task)
+    baselines = capture_baselines(run_copy, project, task)
+    report = verify(BaselineSandbox(make_sandbox(run_copy, project, task), baselines),
+                    run_copy.repo, task)
     print(format_verification(style, report))
     print()
     print("This is the starting state. For a new task, bug fix or feature, the "
@@ -502,6 +665,19 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("session", help="session ID, or a unique start or end of it")
     cancel.add_argument("--wait", type=float, default=60, help="seconds to wait for it to stop")
     cancel.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
+
+    resume = sub.add_parser("resume", help="continue a cancelled, interrupted or paused session")
+    resume.add_argument("session", help="session ID, or a unique start or end of it")
+    resume.add_argument("--accept-current-state", action="store_true",
+                        help="continue although the working copy differs from the checkpoint or "
+                             "an action was cut off (it is never repeated automatically)")
+    resume.add_argument("--model", help="Ollama model name (default: from config)")
+    resume.add_argument("--no-think", action="store_true", help="turn thinking mode off")
+    resume.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
+
+    review = sub.add_parser("review", help="run the final checks again on a session's working copy")
+    review.add_argument("session", help="session ID, or a unique start or end of it")
+    review.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
     return parser
 
 
@@ -510,7 +686,8 @@ def main(argv: list[str] | None = None) -> int:
     style = Style()
     command = {
         "projects": cmd_projects, "fetch": cmd_fetch, "run": cmd_run, "baseline": cmd_baseline,
-        "sessions": cmd_sessions, "show": cmd_show, "cancel": cmd_cancel,
+        "sessions": cmd_sessions, "show": cmd_show, "cancel": cmd_cancel, "resume": cmd_resume,
+        "review": cmd_review,
     }[args.command]
     try:
         return command(args, style)

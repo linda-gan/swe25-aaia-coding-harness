@@ -264,6 +264,19 @@ class ContextManager:
             "largest_request": self.largest_request,
         }
 
+    @classmethod
+    def restore(cls, task: Task, navigator: CodeNavigator, config: ContextConfig,
+                tool_schemas: list[dict], state: dict, fix_rounds: int = 3) -> "ContextManager":
+        """The same manager as saved in a session, so the view continues unchanged:
+        same marker code (it is in the saved system prompt), same shortened results."""
+        manager = cls(task, navigator, config, tool_schemas, nonce=state["nonce"],
+                      fix_rounds=fix_rounds)
+        manager.stubbed = set(state.get("stubbed", []))
+        manager.overview_removed = bool(state.get("overview_removed", False))
+        manager.compactions = int(state.get("compactions", 0))
+        manager.largest_request = int(state.get("largest_request", 0))
+        return manager
+
     def stats(self) -> dict:
         return {
             "max_tokens": self.config.max_tokens,

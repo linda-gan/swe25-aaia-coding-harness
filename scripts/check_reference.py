@@ -25,7 +25,8 @@ from pathlib import Path
 from harness.cli import Style, format_verification, heading
 from harness.config import PROJECT_ROOT, HarnessConfig, load_config, load_task
 from harness.projects import select_project
-from harness.runner import check_task, make_sandbox
+from harness.baseline import BaselineSandbox
+from harness.runner import capture_baselines, check_task, make_sandbox
 from harness.sandbox import DockerSandbox
 from harness.verification import VerificationReport, verify
 from harness.workspace import RunCopy, apply_patch, create_project_copy
@@ -58,7 +59,8 @@ def check_reference(task_path: Path, patch: Path, config: HarnessConfig,
     task = load_task(task_path)
     project = select_project(config, task)
     check_task(task, project)
-    sandbox = make_sandbox(run_copy, project, task, sandbox_factory)
+    baselines = capture_baselines(run_copy, project, task, sandbox_factory)
+    sandbox = BaselineSandbox(make_sandbox(run_copy, project, task, sandbox_factory), baselines)
     before = verify(sandbox, run_copy.repo, task)
     apply_patch(run_copy.repo, patch)
     after = verify(sandbox, run_copy.repo, task)

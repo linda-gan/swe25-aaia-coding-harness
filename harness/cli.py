@@ -190,7 +190,7 @@ def cmd_baseline(args, style: Style) -> int:
     print(style.bold("Baseline: final checks on the unchanged starting code"))
     print(f"  Target: {config.target.url} @ {config.target.commit[:12]}")
     print(f"  Copy:   {run_copy.repo}")
-    report = verify(make_sandbox(run_copy, config), run_copy.repo, task)
+    report = verify(make_sandbox(run_copy, config, task), run_copy.repo, task)
     print(format_verification(style, report))
     print()
     print("This is the starting state. For a bug-fix task the acceptance check "

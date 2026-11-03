@@ -12,14 +12,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from harness.config import PROJECT_ROOT, HarnessConfig, Task
+from harness.config import HarnessConfig, Task
 from harness.controller import AgentController, Event, RunResult
 from harness.repo_tools import RepositoryTools
 from harness.sandbox import DockerSandbox
 from harness.verification import VerificationReport, verify
 from harness.workspace import RunCopy
 
-ACCEPTANCE_DIR = PROJECT_ROOT / "acceptance"
+# Checks whose command contains a path under this mount need the task's
+# acceptance folder.
+ACCEPTANCE_MOUNT = "/acceptance"
 
 
 @dataclass
@@ -41,18 +43,30 @@ class RunReport:
 
 
 def check_task(task: Task, config: HarnessConfig) -> None:
-    """Fail early, with a clear message, if the task names unknown checks."""
+    """Fail early, with a clear message, if the task cannot run as written."""
     for name in [*task.agent_checks, *task.final_checks]:
         if name not in config.checks:
             raise ValueError(
                 f"The task uses check {name!r}, which is not defined under [checks] "
                 f"in config/target.toml. Defined: {', '.join(config.checks)}."
             )
+        if task.acceptance_dir is None and uses_acceptance_mount(config.checks[name]):
+            raise ValueError(
+                f"The task uses check {name!r}, which runs acceptance tests, but the "
+                "task file names no acceptance folder. Add acceptance_tests = \"<folder>\"."
+            )
 
 
-def make_sandbox(run_copy: RunCopy, config: HarnessConfig, sandbox_factory=DockerSandbox):
+def uses_acceptance_mount(argv: list[str]) -> bool:
+    return any(part == ACCEPTANCE_MOUNT or part.startswith(ACCEPTANCE_MOUNT + "/")
+               for part in argv)
+
+
+def make_sandbox(run_copy: RunCopy, config: HarnessConfig, task: Task,
+                 sandbox_factory=DockerSandbox):
+    """A sandbox for this run. Only this task's acceptance folder is mounted."""
     return sandbox_factory(
-        run_copy.repo, config.sandbox, config.checks, acceptance_dir=ACCEPTANCE_DIR
+        run_copy.repo, config.sandbox, config.checks, acceptance_dir=task.acceptance_dir
     )
 
 
@@ -69,7 +83,7 @@ def run_task(
     check_task(task, config)
     started_at = datetime.now().isoformat(timespec="seconds")
     start = time.monotonic()
-    sandbox = make_sandbox(run_copy, config, sandbox_factory)
+    sandbox = make_sandbox(run_copy, config, task, sandbox_factory)
     controller = AgentController(
         model=model,
         tools=RepositoryTools(run_copy.repo),

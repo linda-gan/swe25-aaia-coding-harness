@@ -11,7 +11,7 @@ import subprocess
 import pytest
 
 from harness.cli import Style, format_result, format_verification
-from harness.config import load_config, Task
+from harness.config import ACCEPTANCE_ROOT, load_config, Task
 from harness.controller import FINISHED
 from harness.model import ScriptedModelClient, tool_reply
 from harness.runner import check_task, run_task
@@ -27,6 +27,7 @@ TASK = Task(
     editable_files=["src/app/model.py"],
     agent_checks=["unit_tests"],
     final_checks=["acceptance", "unit_tests"],
+    acceptance_dir=ACCEPTANCE_ROOT / "invalid_quantity",  # not read by FakeSandbox
 )
 
 

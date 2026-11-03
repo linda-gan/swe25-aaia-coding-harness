@@ -30,7 +30,7 @@ With thinking off, each model reply is faster, but the agent took more steps: it
 |---|---|
 | Repository | [cosmicpython/code](https://github.com/cosmicpython/code), branch `master` |
 | Commit | `14c84797ffa77255d53cf1a02fe6aafda2b68aeb` |
-| Regression tests | `tests/unit` (20 tests; integration and end-to-end tests need Postgres and Redis and are not used) |
+| Regression tests | `tests/unit` (20 tests). Also available: `integration_sqlite`, 6 integration tests that use an in-memory SQLite database (the end-to-end tests and one integration test need Postgres or Redis and are not used) |
 
 **The bug.** Nothing checks that an order quantity is positive. Allocating `-5` units from a batch of 10 leaves 15 available: a negative order adds stock. The behavior spans several modules: a command goes through the message bus to the handler and the domain model, and an out-of-stock notification can come back out.
 
@@ -40,7 +40,7 @@ With thinking off, each model reply is faster, but the agent took more steps: it
 - Checks the agent may run itself: `unit_tests`
 - Checks the harness runs afterwards: `acceptance`, `unit_tests`
 
-**The acceptance check** (`acceptance/test_acceptance_invalid_quantity.py`) lives outside the agent's writable area and is mounted read-only into the sandbox. It uses its own test fakes, so it doesn't depend on files the agent could edit. A one-line fix only in `model.py` doesn't pass it, because the model would then report the product as out of stock and send a false notification.
+**The acceptance check** (`acceptance/invalid_quantity/test_acceptance_invalid_quantity.py`) lives outside the agent's writable area and is mounted read-only into the sandbox. It uses its own test fakes, so it doesn't depend on files the agent could edit. A one-line fix only in `model.py` doesn't pass it, because the model would then report the product as out of stock and send a false notification.
 
 On the starting code (`python -m harness baseline tasks/invalid_quantity.toml`):
 
@@ -78,7 +78,7 @@ ollama pull qwen3.6:35b
 Check the setup:
 
 ```bash
-pytest                          # 87 tests, no model needed
+pytest                          # 106 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -118,11 +118,13 @@ Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` i
 |---|---|
 | `[target]` | repository URL, pinned commit, regression test path |
 | `[sandbox]` | image, 120 s time limit per check, 1 GB memory, 1 CPU, 8,000-character output limit |
-| `[checks]` | the only commands that can run in the sandbox, by name |
+| `[checks]` | the only commands that can run in the sandbox, by name: `unit_tests`, `acceptance`, `integration_sqlite` |
 | `[limits]` | 30 actions, 10 refused actions, 3 replies in a row without a tool call, 6,000 characters of tool output per result |
 | `[model]` | Ollama host, model name, thinking on or off, 32,768-token context, 600 s per reply |
 
-A task file in `tasks/` sets the description, `editable_files`, `agent_checks` and `final_checks`.
+A task file in `tasks/` sets the description, `editable_files`, `agent_checks`, `final_checks` and `acceptance_tests`.
+
+**Acceptance tests per task.** Each task keeps its acceptance tests in its own folder, `acceptance/<folder>/`, and names it with `acceptance_tests = "<folder>"`. Only that folder is mounted, read-only, at `/acceptance` in the sandbox, so one task never runs another task's acceptance tests. The name must be a plain folder name under `acceptance/` (no `/` or `..`, no symlink pointing elsewhere), because whatever it names is mounted into the container. A task that uses a check reading `/acceptance` but names no folder is refused before the run starts.
 
 ## Architecture
 
@@ -263,7 +265,7 @@ flowchart LR
     subgraph Host["Host (WSL)"]
         Harness["Harness<br/>validates every request"]
         Pristine[("target-pristine<br/>never edited")]
-        Acceptance[("acceptance/")]
+        Acceptance[("acceptance/task folder<br/>only this task's tests")]
         Copy[("runs/id/repo")]
         Git["git diff, git status<br/>fsmonitor, hooks and<br/>diff helpers disabled"]
     end
@@ -288,7 +290,7 @@ flowchart LR
 - **Git cannot be turned against the host.** The file tools block `.git`, and inside the container `/work/.git` is read-only. Git on the host runs with fsmonitor, hooks and external diff and textconv helpers disabled.
 - **Untrusted input.** Model replies are parsed and validated, never executed directly. The system prompt tells the model to treat file contents and command output as data, not instructions.
 - **No push, merge or deployment.** The pristine clone has no Git remote, the agent has no Git or network tool, and the container has no network.
-- **Credentials stay outside.** No credentials exist in the project or in any copy, and containers only see the run copy and the acceptance tests.
+- **Credentials stay outside.** No credentials exist in the project or in any copy, and containers only see the run copy and the task's own acceptance folder.
 - **Visible results.** A scope check fails the run if any file outside `editable_files` changed, for example a file written by code run in a test.
 
 ## Tests
@@ -297,7 +299,7 @@ flowchart LR
 pytest
 ```
 
-All 87 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing.
+All 106 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing.
 
 | Handout test | Where |
 |---|---|
@@ -308,6 +310,8 @@ All 87 tests run without a model, an account or an API key. The controller tests
 | Action limit | `test_controller.py`: a repeating scripted reply stops after the limit, and no further action runs |
 | Output limit | `test_output.py`, `test_controller.py`, `test_sandbox.py`: large output is bounded and marked `[output shortened: ...]` |
 | Bug fix | `test_runner.py`: with a fake sandbox in place of Docker, the acceptance check fails on the starting code and passes after the change, and existing tests still pass. The real check is shown by `baseline` and `run` (see Results) |
+
+`test_acceptance_setup.py` checks that each task mounts only its own acceptance folder, that folder names which could point elsewhere are refused, and that the `integration_sqlite` check lists only tests that need no services.
 
 Further tests cover stuck commands (stopped together with their child processes), no network in the sandbox, read-only `.git` and acceptance mounts, run copies, the scope check, the Ollama client's error handling and context limit, and the run record.
 
@@ -323,8 +327,8 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                87 automated tests
-acceptance/           acceptance check, outside the agent's writable area
+tests/                106 automated tests
+acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
 tasks/                task files
 config/target.toml    all settings
 sandbox/              Dockerfile and pinned dependencies for the sandbox image

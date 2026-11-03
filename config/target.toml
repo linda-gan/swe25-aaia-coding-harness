@@ -14,6 +14,18 @@ max_output_chars = 8000
 [checks]
 unit_tests = ["pytest", "tests/unit", "-q", "-p", "no:cacheprovider"]
 acceptance = ["pytest", "/acceptance", "-q", "-p", "no:cacheprovider"]
+# Integration tests that use an in-memory SQLite database: repository, unit of
+# work and the read model, through the real SQLAlchemy mapping. They need no
+# Postgres, Redis or network. The one Postgres test (concurrent updates) is
+# left out by name; it would wait 10 s for a database and then fail.
+integration_sqlite = [
+    "pytest",
+    "tests/integration/test_repository.py",
+    "tests/integration/test_uow.py",
+    "tests/integration/test_views.py",
+    "-q", "-p", "no:cacheprovider",
+    "-k", "not test_concurrent_updates_to_version_are_not_allowed",
+]
 
 [limits]
 max_actions = 30            # tool calls per run

@@ -14,7 +14,7 @@ def test_loads_sandbox_settings_and_checks():
     cfg = load_config()
     assert cfg.sandbox.image == "cosmic-sandbox"
     assert cfg.sandbox.timeout_seconds > 0
-    assert set(cfg.checks) == {"unit_tests", "acceptance"}
+    assert set(cfg.checks) == {"unit_tests", "acceptance", "integration_sqlite"}
     assert cfg.checks["unit_tests"][0] == "pytest"
 
 

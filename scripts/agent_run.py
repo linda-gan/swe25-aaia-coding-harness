@@ -36,6 +36,7 @@ def main() -> int:
     if args.no_think:
         model_config = dataclasses.replace(model_config, think=False)
 
+    task = load_task(args.task)
     start = time.monotonic()
 
     def show(event):
@@ -45,8 +46,8 @@ def main() -> int:
         model=OllamaClient(model_config),
         tools=RepositoryTools(args.repo),
         sandbox=DockerSandbox(args.repo, config.sandbox, config.checks,
-                              acceptance_dir=PROJECT_ROOT / "acceptance"),
-        task=load_task(args.task),
+                              acceptance_dir=task.acceptance_dir),
+        task=task,
         limits=config.limits,
         on_event=show,
     )

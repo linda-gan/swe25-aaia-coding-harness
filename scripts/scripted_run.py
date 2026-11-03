@@ -47,7 +47,7 @@ def main() -> int:
     config = load_config()
     task = load_task(PROJECT_ROOT / "tasks" / "invalid_quantity.toml")
     sandbox = DockerSandbox(repo, config.sandbox, config.checks,
-                            acceptance_dir=PROJECT_ROOT / "acceptance")
+                            acceptance_dir=task.acceptance_dir)
     controller = AgentController(
         model=ScriptedModelClient(SCRIPT),
         tools=RepositoryTools(repo),

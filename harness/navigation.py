@@ -56,7 +56,7 @@ class CodeNavigator:
         if not isinstance(name, str) or not name.strip():
             raise ToolError("Symbol name must be a non-empty string, such as Batch or Product.allocate.")
         name = name.strip()
-        modules = self._modules()
+        modules = self.modules()
         found = [s for m in modules.values() for s in m.symbols
                  if s.qualified_name == name or s.qualified_name.split(".")[-1] == name]
         lines = [s.describe() for s in found[:MAX_SYMBOL_RESULTS]]
@@ -84,7 +84,7 @@ class CodeNavigator:
 
     def dependencies(self, path: str) -> str:
         """Which repository modules a file imports, and which import it."""
-        modules = self._modules()
+        modules = self.modules()
         target = self._module_for(path, modules)
         by_name = {m.name: m for m in modules.values()}
 
@@ -137,7 +137,7 @@ class CodeNavigator:
 
     # ---- parsing -----------------------------------------------------------
 
-    def _modules(self) -> dict[str, ModuleInfo]:
+    def modules(self) -> dict[str, ModuleInfo]:
         """Every Python file in the repository, parsed. Keyed by relative path."""
         modules = {}
         for file in self.tools.files("."):

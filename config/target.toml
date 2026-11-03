@@ -40,6 +40,16 @@ max_denied_actions = 10     # refused or failed tool calls per run
 max_retries = 3             # replies in a row without a usable tool call
 max_tool_output_chars = 6000
 
+# What is sent to the model per request (see "Context" in the README).
+[context]
+max_tokens = 24000          # size limit per request incl. tool definitions, about 3 characters
+                            # per token; must stay below 90% of num_ctx
+keep_recent_results = 6     # the newest tool results stay in full unless the limit cannot
+                            # be met otherwise
+repo_map_chars = 3000       # repository map in the first message
+selected_files = 4          # files whose outline the harness adds to the first message
+selected_chars = 4000       # for those outlines together
+
 [model]
 host = "http://localhost:11434"
 name = "qwen3.6:35b"

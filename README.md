@@ -112,7 +112,7 @@ Check the setup:
 
 ```bash
 python -m harness projects      # the allowed project, its clone (should say "ready") and tasks
-pytest                          # 180 tests, no model needed
+pytest                          # 203 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -161,6 +161,7 @@ Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` i
 | `[projects.<name>]` | one entry per allowed project: repository URL, pinned commit, pristine clone folder, sandbox image |
 | `[projects.<name>.checks]` | the only commands that can run in that project's sandbox, by name: `unit_tests`, `acceptance`, `integration_sqlite` for `cosmicpython` |
 | `[sandbox]` | shared by all projects: 120 s time limit per check, 1 GB memory, 1 CPU, 8,000-character output limit |
+| `[context]` | what is sent to the model per request: 24,000-token limit, 6 newest results kept in full, 3,000-character repository map, outlines of 4 selected files in 4,000 characters (see Context management) |
 | `[limits]` | 30 actions, 10 refused actions, 3 replies in a row without a tool call, 6,000 characters of tool output per result |
 | `[model]` | Ollama host, model name, thinking on or off, 32,768-token context, 600 s per reply |
 
@@ -182,7 +183,9 @@ flowchart TB
     Pristine[("workspace/target-pristine<br/>pinned commit")] -.->|"copied"| Copy[("workspace/runs/id/repo")]
     Workspace -.-> Copy
     Runner -->|"run()"| Controller["AgentController<br/>controller.py"]
-    Controller <-->|"next_reply()"| Client["OllamaClient<br/>ollama_client.py"]
+    Controller -->|"initial_messages(), view()"| Context["ContextManager<br/>context.py"]
+    Context -->|"repository map, outlines"| Navigator
+    Controller <-->|"next_reply(view)"| Client["OllamaClient<br/>ollama_client.py"]
     Client <-->|"HTTP /api/chat"| Ollama(["Ollama<br/>qwen3.6:35b"])
     Controller -->|"validate()"| Actions["Validation<br/>actions.py"]
     Controller -->|"list, read, search, edit"| Tools["RepositoryTools<br/>repo_tools.py"]
@@ -210,6 +213,7 @@ How the modules map to the handout's parts:
 | Model | `model.py`, `ollama_client.py` | model interface, scripted model for tests, Ollama client |
 | Repository tools | `repo_tools.py` | list, read, search and edit inside the run copy |
 | Navigation | `navigation.py` | symbols, file outlines and module dependencies (parsed with `ast`, never run); read-only Git status and diff |
+| Context | `context.py`, `prompts.py` | repository map and file selection; trusted and untrusted text kept apart; history within the size limit |
 | Execution | `sandbox.py` | configured checks in a locked-down container; output and exit codes |
 | Limits | `controller.py`, `output.py`, `ollama_client.py` | action, refusal and retry limits; output limits; context limit |
 | Verification | `verification.py`, `workspace.py`, `runner.py` | final checks, scope check, diff, run record |
@@ -248,6 +252,13 @@ classDiagram
         +resolve(path) Path
         +files(path)
     }
+    class ContextManager {
+        +initial_messages() list
+        +view(messages) list
+        +overview() str
+        +estimate(view) int
+        +stats() dict
+    }
     class CodeNavigator {
         +find_symbol(name) str
         +outline(path) str
@@ -279,6 +290,8 @@ classDiagram
     AgentController --> ModelClient : asks for actions
     AgentController --> RepositoryTools : file actions
     AgentController --> CodeNavigator : navigation
+    AgentController --> ContextManager : what the model sees
+    ContextManager --> CodeNavigator : map and outlines
     CodeNavigator --> RepositoryTools : same path checks
     AgentController --> DockerSandbox : agent checks
     AgentController ..> RunResult : returns
@@ -300,16 +313,56 @@ They parse Python with the standard library's `ast` module: the source is read a
 
 `verify()` in `verification.py` runs the final checks through the same `DockerSandbox` and builds the `VerificationReport`. `run_task()` in `runner.py` ties the controller and verification together and writes the run record.
 
+## Context management
+
+The controller keeps the full, unchanged conversation in its run result; that is what `run.json` stores. Before every model request, `ContextManager.view()` (in `context.py`) prepares what is actually sent.
+
+```mermaid
+flowchart TB
+    subgraph Trusted["Trusted: sent exactly as written, never shortened"]
+        System["System prompt<br/>rules, editable files, checks,<br/>this run's marker code"]
+        TaskMsg["Task message<br/>description with acceptance criteria"]
+    end
+    subgraph Untrusted["Untrusted: inside markers with a random code"]
+        Overview["Repository overview<br/>map, selected files, outlines"]
+        Results["Tool results<br/>files, search, checks, Git"]
+    end
+    Summary["Summary of shortened steps<br/>written by the harness from its<br/>own step records"]
+    Record[("Full history<br/>run.json")] --> View{"view():<br/>over max_tokens?"}
+    View -->|"no"| Send["Send to the model"]
+    View -->|"yes"| Compact["1. older results become notes, down to 60%<br/>2. newer results, only if still over the limit<br/>3. overview, only if still over the limit"]
+    Compact --> Summary --> Send
+    Trusted --> Send
+    Untrusted --> Send
+```
+
+**The first messages.** The system prompt holds the rules, the editable files and the checks. The task message is the task description, which states the acceptance criteria. Both come from the harness and the task file, so they are trusted, and they are never shortened. A third message is the repository overview:
+- a map of folders, Python files and their top-level names, within 3,000 characters (test-file names go first when it doesn't fit, then names of unselected files, then all names, then lines);
+- the files the harness ranks as most relevant, with the reason for each;
+- their outlines, within 4,000 characters.
+
+Ranking gives 10 points for an editable file, 8 for a path named in the task, 5 for each code name from the task the file defines (such as `CreateBatch`), and 1 for each shared word (at most 5). For the feature task, the four editable files are selected. For the Stage 1 task, the two editable files plus `tests/unit/test_handlers.py` and `test_batches.py` are selected. At the start of a run, the request is about 4,200 tokens.
+
+**Trusted and untrusted text.** The overview and every tool result reach the model between `<<<untrusted CODE source=...>>>` and `<<<end CODE>>>`. CODE is random for each run and is named only in the system prompt, which tells the model that marked text is data, never instructions. Repository text cannot guess CODE, and any copy of the markers inside the text is defused, so a file cannot close the block and pretend to be an instruction.
+
+**The size limit.** `[context] max_tokens = 24000` limits each request, including the tool definitions, estimated at 3 characters per token (the same estimate as the Ollama client's own guard, which stays as the last line of defense at 90% of `num_ctx`). When a request would be larger:
+1. Results older than the 6 newest are replaced, oldest first, by a note such as `[Result of step 3 (read_file src/allocation/domain/model.py) removed ...]`, until the request is down to 60% of the limit. Old `edit_file` arguments are shortened to their length. Compacting well below the limit leaves room, so the start of the conversation stays the same for the next requests and Ollama can reuse its cache.
+2. Only if that is not enough: newer results, always keeping the very last one.
+3. Only if that is still not enough: the repository overview.
+
+A summary then follows the overview, listing what the shortened steps did: files read, files edited, checks and their status, refused requests. It is written by the harness from its own step records, which keep only checked values (paths, check names, code names), never repository text or the model's free text such as search queries. Each compaction appears as a `context` event in the progress output and in `run.json`, which also stores the largest request and the number of shortened results.
+
 ## The agent loop
 
 ```mermaid
 flowchart TD
-    Start(["Task and rules"]) --> Ask["Ask the model for an action"]
+    Start(["Task, rules and repository overview"]) --> Prepare["Prepare the view: mark untrusted text,<br/>shorten old results if over the size limit"]
+    Prepare --> Ask["Ask the model for an action"]
     Ask -->|"model unreachable or context full"| StopModel(["Stop: model error"])
     Ask --> HasCall{"Tool call in reply?"}
     HasCall -->|"no"| Retry["Count retry, send a nudge"]
     Retry -->|"more than 3 in a row"| StopRetry(["Stop: too many replies without a tool call"])
-    Retry --> Ask
+    Retry --> Prepare
     HasCall -->|"yes"| Validate{"Valid request?<br/>known tool, correct arguments,<br/>allowed file or check"}
     Validate -->|"no"| Refuse["Return error to model, count refusal"]
     Validate -->|"finish"| Done(["Stop: finished"])
@@ -317,9 +370,9 @@ flowchart TD
     Limit -->|"yes"| StopLimit(["Stop: action limit reached"])
     Limit -->|"no"| Run["Run tool, shorten output"]
     Run -->|"tool refuses, for example path outside repo"| Refuse
-    Run -->|"result"| Ask
+    Run -->|"result"| Prepare
     Refuse -->|"more than 10"| StopRefused(["Stop: too many refused actions"])
-    Refuse --> Ask
+    Refuse --> Prepare
     Done --> Verify["Harness runs final checks,<br/>scope check and git diff"]
     StopModel --> Verify
     StopRetry --> Verify
@@ -372,11 +425,12 @@ flowchart LR
 pytest
 ```
 
-All 180 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Three tests need more: two need the pristine clone (the reference patch applies, and navigation finds what the feature needs), and one needs the pristine clone, Docker and the `cosmic-sandbox` image. They are skipped otherwise.
+All 203 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Four tests need more: three need the pristine clone (the reference patch applies, navigation finds what the feature needs, and file selection picks the editable files of both tasks), and one needs the pristine clone, Docker and the `cosmic-sandbox` image. They are skipped otherwise.
 
 | Handout test | Where |
 |---|---|
 | File tools | `test_repo_tools.py`: read, search and edit; `../`, absolute paths, `.git` and escaping symlinks rejected |
+| Context | `test_context.py`: editable and named files are selected first, files without points never; the map stays within its limit and drops details in the documented order; every request stays within `max_tokens`; the system prompt and task message are unchanged after compaction; the newest results stay in full while the limit allows; the summary is built only from harness records; repository text appears only inside markers, and fake end markers are defused; the full history is kept in the record |
 | Navigation | `test_navigation.py`: symbols, outlines and dependencies (relative and `TYPE_CHECKING` imports) on a small `src/`-layout repository; on the real target, the tools reach exactly the four files the feature may change; Git status and diff before and after an edit; same path checks; repository code is never run; the model can call every tool |
 | Controller | `test_controller.py`: a scripted `read_file` call runs, and the model receives its result |
 | Invalid request | `test_actions.py`, `test_controller.py`: unknown tools and invalid arguments give a clear error, and nothing runs |
@@ -395,7 +449,8 @@ Further tests cover stuck commands (stopped together with their child processes)
 ## Limitations and observations
 
 - One allowed project so far. The config and the commands support several, and the tests use a second, made-up project. Navigation, context management and sessions are still to come in Stage 2.
-- Context is protected only by a hard limit. A conversation that would exceed the model's context window stops the run instead of being summarized.
+- The history summary is mechanical: it lists what shortened steps did, not what the model learned from them. A result that was shortened has to be fetched again if it is needed. Token counts are estimated (3 characters per token), not counted by the model's tokenizer.
+- File selection uses names and words, not meaning: a task that describes behavior in words that appear in no file name or symbol gets fewer useful selections. Editable files always rank high.
 - The `search` tool matches plain text. In Stage 1 the model sometimes searched with regular expressions such as `qty.*0`, even though the tool description says plain text: once in a run with thinking on, three times in the run with thinking off. Those searches found nothing, but cost actions. Regex search is still left out on purpose (see Navigation tools); instead, an empty result now explains this, and `find_symbol` covers the most common reason to search.
 - The navigation tools understand Python only, and find definitions by name, not every call site (`search` finds uses). Dynamic imports such as `importlib.import_module(name)` are not seen.
 - By design, the agent can't run the acceptance check: it sees only the task description and the unit tests.
@@ -405,7 +460,7 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                180 automated tests
+tests/                203 automated tests
 acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
 tasks/                task files: invalid_quantity (Stage 1), batch_expiry (Stage 2)
 reference/            hand-written reference solutions, one patch per task, never shown to the agent

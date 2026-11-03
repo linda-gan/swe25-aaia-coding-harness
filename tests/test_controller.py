@@ -135,8 +135,11 @@ def test_invalid_request_gives_error_and_runs_nothing(repo, bad_call):
     assert sandbox.ran == []
     assert (repo / "src/app/model.py").read_text() == ORIGINAL
     assert (repo / "tests/test_model.py").read_text() == "def test_x(): pass\n"
-    # The model was told about the error and could continue.
-    assert model.received[1][-1]["content"].startswith("Error:")
+    # The model was told about the error and could continue. Like every tool
+    # result, the error reaches it inside the untrusted markers.
+    sent = model.received[1][-1]["content"]
+    assert sent.startswith("<<<untrusted ")
+    assert sent.splitlines()[1].startswith("Error:")
 
 
 def test_too_many_refused_actions_stop_the_run(repo):
@@ -183,8 +186,9 @@ def test_large_tool_output_is_shortened_before_reaching_the_model(repo):
     controller.run()
 
     sent = model.received[1][-1]["content"]
-    assert "[output shortened:" in sent
-    assert len(sent) < 600
+    inside_markers = sent.split("\n", 1)[1].rsplit("\n", 1)[0]
+    assert "[output shortened:" in inside_markers
+    assert len(inside_markers) < 600
 
 
 # ---- failures stay visible -------------------------------------------------

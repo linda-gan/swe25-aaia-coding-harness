@@ -42,6 +42,16 @@ class LimitsConfig:
 
 
 @dataclass(frozen=True)
+class ContextConfig:
+    """How much is sent to the model per request. See harness/context.py."""
+    max_tokens: int = 24000  # size limit per request, estimated at 3 characters per token
+    keep_recent_results: int = 6  # newest tool results kept in full while the limit allows
+    repo_map_chars: int = 3000  # repository map in the first message
+    selected_files: int = 4  # files whose outline is shown in the first message
+    selected_chars: int = 4000  # for those outlines together
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     host: str
     name: str
@@ -66,6 +76,7 @@ class HarnessConfig:
     projects: dict[str, ProjectConfig]  # the allowlist
     limits: LimitsConfig
     model: ModelConfig
+    context: ContextConfig = ContextConfig()
 
     def project(self, name: str) -> ProjectConfig:
         """The allowed project with this name, or a clear refusal."""
@@ -119,11 +130,38 @@ def _build_config(data: dict, workspace_dir: Path) -> HarnessConfig:
     if len(set(clones)) != len(clones):
         raise ValueError("Two projects use the same pristine folder.")
 
+    model = ModelConfig(**data["model"])
+    context_values = dict(data.get("context", {}))
+    # Without an explicit limit, use the default, but never more than fits the model.
+    context_values.setdefault("max_tokens", min(ContextConfig.max_tokens,
+                                                int(model.num_ctx * CONTEXT_SAFETY)))
+    context = ContextConfig(**context_values)
+    _check_context(context, model)
     return HarnessConfig(
         projects=projects,
         limits=LimitsConfig(**data["limits"]),
-        model=ModelConfig(**data["model"]),
+        model=model,
+        context=context,
     )
+
+
+# The Ollama client refuses requests above this share of num_ctx, to leave
+# room for the reply. The context limit must fit below it.
+CONTEXT_SAFETY = 0.9
+# Size estimate used everywhere: about 3 characters per token (errs on the safe side).
+CHARS_PER_TOKEN = 3
+
+
+def _check_context(context: ContextConfig, model: ModelConfig) -> None:
+    ceiling = int(model.num_ctx * CONTEXT_SAFETY)
+    if not 0 < context.max_tokens <= ceiling:
+        raise ValueError(
+            f"[context] max_tokens must be between 1 and {ceiling} "
+            f"(90% of the model's num_ctx = {model.num_ctx})."
+        )
+    for name in ["keep_recent_results", "repo_map_chars", "selected_files", "selected_chars"]:
+        if getattr(context, name) < 0:
+            raise ValueError(f"[context] {name} must not be negative.")
 
 
 def _build_project(name: str, values: dict, resources: dict, workspace_dir: Path) -> ProjectConfig:

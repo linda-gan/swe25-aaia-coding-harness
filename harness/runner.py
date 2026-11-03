@@ -94,6 +94,7 @@ def run_task(
         task=task,
         limits=config.limits,
         on_event=on_event,
+        context=config.context,
     )
     agent = controller.run()
     # Verification always runs, whatever the reason the agent stopped.
@@ -133,6 +134,7 @@ def save_record(report: RunReport, project: ProjectConfig) -> Path:
             "actions": agent.actions,
             "denied": agent.denied,
             "retries": agent.retries,
+            "context": agent.context,
             "events": [asdict(e) for e in agent.events],
             "messages": agent.messages,
         },

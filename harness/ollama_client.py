@@ -11,14 +11,13 @@ import json
 import urllib.error
 import urllib.request
 
-from harness.config import ModelConfig
+# CHARS_PER_TOKEN: rough size estimate. Real tokens are usually a bit larger
+# than 3 characters, so this errs on the side of stopping early.
+# CONTEXT_SAFETY: stop before the context is full, to leave room for the reply.
+# Both live in config.py, so the context limit (harness/context.py) and this
+# guard use the same numbers.
+from harness.config import CHARS_PER_TOKEN, CONTEXT_SAFETY, ModelConfig
 from harness.model import ModelError, ModelReply, ToolCall
-
-# Rough size estimate. Real tokens are usually a bit larger than 3 characters,
-# so this errs on the side of stopping early rather than overflowing.
-CHARS_PER_TOKEN = 3
-# Stop before the context is completely full, to leave room for the reply.
-CONTEXT_SAFETY = 0.9
 
 
 class OllamaClient:

@@ -11,16 +11,17 @@ succeeded; the harness checks that separately afterwards.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from harness.actions import Action, ValidationError, tool_schemas, validate
-from harness.config import LimitsConfig, Task
+from harness.actions import Action, ValidationError, normalize_path, tool_schemas, validate
+from harness.config import ContextConfig, LimitsConfig, Task
+from harness.context import ContextManager
 from harness.model import ModelClient, ModelError, ModelReply
 from harness.navigation import CodeNavigator
 from harness.output import shorten
-from harness.prompts import system_prompt
 from harness.repo_tools import RepositoryTools, ToolError
 from harness.sandbox import CheckResult, SandboxError
 
@@ -54,8 +55,9 @@ class RunResult:
     denied: int = 0  # tool calls that were refused or failed
     retries: int = 0  # replies without a usable tool call
     duration_seconds: float = 0.0  # from the first model request to the stop
-    messages: list[dict] = field(default_factory=list)
+    messages: list[dict] = field(default_factory=list)  # full history, never shortened
     events: list[Event] = field(default_factory=list)
+    context: dict = field(default_factory=dict)  # size statistics from the ContextManager
 
     @property
     def finished(self) -> bool:
@@ -73,11 +75,13 @@ class AgentController:
         limits: LimitsConfig,
         on_event: Callable[[Event], None] | None = None,
         navigator: CodeNavigator | None = None,
+        context: ContextConfig | None = None,
     ):
         self.model = model
         self.tools = tools
         # Symbols, outlines, dependencies and Git state, on the same files.
         self.navigator = navigator or CodeNavigator(tools)
+        self.context_config = context or ContextConfig()
         self.sandbox = sandbox
         self.task = task
         self.limits = limits
@@ -88,15 +92,17 @@ class AgentController:
 
     def run(self) -> RunResult:
         self._start = time.monotonic()
-        run = RunResult(stop_reason="", messages=[
-            {"role": "system", "content": system_prompt(self.task)},
-            {"role": "user", "content": self.task.description},
-        ])
+        self.context = ContextManager(self.task, self.navigator, self.context_config, self.schemas)
+        run = RunResult(stop_reason="", messages=self.context.initial_messages())
         retries_in_a_row = 0
 
         while True:
+            # The model gets a prepared view; run.messages keeps the full history.
+            view = self.context.view(run.messages)
+            if self.context.last_compaction:
+                self._emit(run, "context", self.context.last_compaction)
             try:
-                reply = self.model.next_reply(run.messages, self.schemas)
+                reply = self.model.next_reply(view, self.schemas)
             except ModelError as exc:
                 return self._stop(run, MODEL_ERROR, f"The model request failed: {exc}")
 
@@ -126,7 +132,8 @@ class AgentController:
                     run.actions += 1
                     run.denied += 1
                     self._emit(run, "refused", f"{_short(call.name)}: {exc}")
-                    self._add_tool_result(run, str(call.name), f"Error: {exc}")
+                    self._add_tool_result(run, str(call.name), f"Error: {exc}",
+                                          _step(run, None, ok=False, status="refused"))
                     if run.denied > self.limits.max_denied_actions:
                         return self._stop(run, DENIED_LIMIT)
                     continue
@@ -146,7 +153,8 @@ class AgentController:
                 except (ToolError, SandboxError) as exc:
                     run.denied += 1
                     self._emit(run, "refused", f"{action.name}: {exc}")
-                    self._add_tool_result(run, action.name, f"Error: {exc}")
+                    self._add_tool_result(run, action.name, f"Error: {exc}",
+                                          _step(run, action, ok=False, status="error"))
                     if run.denied > self.limits.max_denied_actions:
                         return self._stop(run, DENIED_LIMIT)
                     continue
@@ -154,7 +162,9 @@ class AgentController:
                     return self._stop(run, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
 
                 self._emit(run, "result", output.splitlines()[0] if output else "(no output)")
-                self._add_tool_result(run, action.name, output)
+                status = self._check_status if action.name == "run_check" else None
+                self._add_tool_result(run, action.name, output,
+                                      _step(run, action, ok=True, status=status))
 
     # ---- tools -------------------------------------------------------------
 
@@ -179,14 +189,17 @@ class AgentController:
         if action.name == "edit_file":
             return self.tools.edit_file(args["path"], args["old"], args["new"])
         if action.name == "run_check":
-            return format_check(self.sandbox.run_check(args["name"]))
+            result = self.sandbox.run_check(args["name"])
+            self._check_status = result.status  # for the harness's own step record
+            return format_check(result)
         raise RuntimeError(f"No handler for validated action {action.name!r}")
 
     # ---- helpers -----------------------------------------------------------
 
-    def _add_tool_result(self, run: RunResult, name: str, content: str) -> None:
+    def _add_tool_result(self, run: RunResult, name: str, content: str, step: dict) -> None:
         content = shorten(content, self.limits.max_tool_output_chars)
-        run.messages.append({"role": "tool", "tool_name": _short(name), "content": content})
+        run.messages.append({"role": "tool", "tool_name": _short(name), "content": content,
+                             "harness_step": step})
 
     def _emit(self, run: RunResult, kind: str, message: str) -> None:
         event = Event(kind, message, round(time.monotonic() - self._start, 1))
@@ -196,6 +209,7 @@ class AgentController:
 
     def _stop(self, run: RunResult, reason: str, detail: str = "") -> RunResult:
         run.stop_reason = reason
+        run.context = self.context.stats()
         run.duration_seconds = round(time.monotonic() - self._start, 1)
         self._emit(run, "stop", f"{reason}: {detail}" if detail else reason)
         return run
@@ -230,3 +244,27 @@ def _describe(action: Action) -> str:
 def _short(value, limit: int = 60) -> str:
     text = str(value)
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+# Tools whose validated argument may appear in the harness's step records.
+PATH_TOOLS = {"list_files", "read_file", "outline", "dependencies", "git_diff", "edit_file"}
+IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+
+def _step(run: RunResult, action: Action | None, ok: bool, status: str | None) -> dict:
+    """The harness's own record of one step, used for the history summary.
+
+    Only validated values are kept: paths, check names and identifiers. Free
+    text such as search queries or edit contents is left out on purpose.
+    """
+    target = None
+    if action is not None:
+        args = action.arguments
+        if action.name in PATH_TOOLS and "path" in args:
+            target = normalize_path(args["path"])[:200]
+        elif action.name == "run_check":
+            target = args["name"]  # validated against the task's checks
+        elif action.name == "find_symbol" and IDENTIFIER.fullmatch(args["name"].strip()):
+            target = args["name"].strip()
+    return {"step": run.actions, "tool": action.name if action else "refused request",
+            "target": target, "ok": ok, "status": status}

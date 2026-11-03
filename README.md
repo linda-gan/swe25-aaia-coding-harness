@@ -124,7 +124,7 @@ Check the setup:
 
 ```bash
 python -m harness projects      # the allowed project, its clone (should say "ready") and tasks
-pytest                          # 242 tests, no model needed
+pytest                          # 254 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -151,6 +151,7 @@ python -m harness run tasks/invalid_quantity.toml --no-think
 python -m harness sessions                  # all sessions: status, steps, actions used, task
 python -m harness show 172351-de62cc        # one session; a unique start or end of the ID is enough
 python -m harness show de62cc --history     # also the saved conversation
+python -m harness cancel 174819-970add      # stop a running session (from another terminal)
 ```
 
 `python -m scripts.scripted_feature_run` shows the edit-test-fix loop on the feature task without a model (it needs Docker): a scripted "model" forgets the database mapping, the harness's checks at `finish` fail, the script fixes it in fix round 1, and the second `finish` passes.
@@ -171,7 +172,7 @@ workspace/runs/<date-time-id>/
   changes.diff   the resulting diff
 ```
 
-Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` interrupted with Ctrl+C.
+Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` cancelled (Ctrl+C or `cancel`).
 
 `python -m scripts.scripted_run <repo copy>` runs the whole pipeline with a scripted model that applies the known fix. It's useful for checking the tools and sandbox without a real model.
 
@@ -209,6 +210,8 @@ flowchart TB
     Workspace -.-> Copy
     Runner -->|"run()"| Controller["AgentController<br/>controller.py"]
     Controller -->|"on_pending, on_checkpoint"| Session["Session<br/>session.py"]
+    Runner -->|"Ctrl+C, SIGTERM"| Cancel["CancelToken<br/>cancellation.py"]
+    Cancel -.->|"breaks off waits,<br/>stops at safe points"| Controller
     Session -->|"session.json, lock"| SessionFiles[("workspace/runs/id/")]
     Controller -->|"initial_messages(), view()"| Context["ContextManager<br/>context.py"]
     Context -->|"repository map, outlines"| Navigator
@@ -243,6 +246,7 @@ How the modules map to the handout's parts:
 | Context | `context.py`, `prompts.py` | repository map and file selection; trusted and untrusted text kept apart; history within the size limit |
 | Task execution | `task_record.py`, `controller.py` | task record and step log; edit-test-fix loop at `finish`; per-task action limits |
 | Sessions | `session.py`, `cli.py` | checkpoint after every step; pending action; running or interrupted from the lock; `sessions` and `show` |
+| Cancellation | `cancellation.py`, `sandbox.py`, `cli.py` | Ctrl+C and `cancel` stop a run at a safe point; waits for the model or a check are broken off; containers removed; saved as cancelled |
 | Execution | `sandbox.py` | configured checks in a locked-down container; output and exit codes |
 | Limits | `controller.py`, `output.py`, `ollama_client.py` | action, refusal and retry limits; output limits; context limit |
 | Verification | `verification.py`, `workspace.py`, `runner.py` | final checks, scope check, diff, run record |
@@ -290,6 +294,11 @@ classDiagram
         +finish(verification)
         +status str
         +uncertain_action dict
+    }
+    class CancelToken {
+        +request(reason)
+        +check()
+        +interruptible()
     }
     class SessionStore {
         +all() list
@@ -347,6 +356,7 @@ classDiagram
     AgentController ..> TaskRecord : on_step, wired by the runner
     AgentController ..> Session : on_pending, on_checkpoint
     SessionStore --> Session : finds and loads
+    AgentController --> CancelToken : safe points
     DockerSandbox ..> CheckResult : returns
     VerificationReport --> CheckResult : final checks
 ```
@@ -481,10 +491,13 @@ stateDiagram-v2
     running --> verifying: agent loop stopped
     verifying --> passed: all final checks pass
     verifying --> failed: a final check fails or cannot run
-    running --> interrupted: process gone (Ctrl+C, crash, kill)
+    running --> cancelled: Ctrl+C or cancel
+    verifying --> cancelled: Ctrl+C or cancel
+    running --> interrupted: process gone (crash, kill -9)
     verifying --> interrupted: process gone
     passed --> [*]
     failed --> [*]
+    cancelled --> [*]
 ```
 
 **What is saved.** `session.json` is the checkpoint. It is written after every completed step and when the run stops, in the same safe way as the task record (temporary file, then `os.replace`). It holds:
@@ -499,7 +512,7 @@ Together with `task.json` (task details and steps), this is everything `show` di
 
 **Pending action.** Just before an action or the finish checks start, the session saves "step N started: tool, target". The next checkpoint clears it. If the process ends in between, the pending action stays in the file.
 
-**Running or interrupted?** While a run is active, its process holds an exclusive lock (`flock`) on `session.lock`. The operating system releases the lock when the process ends in any way: normally, by Ctrl+C, by a crash or by `kill -9`. So a session saved as running or verifying whose lock is free belongs to a process that is gone. It is shown as **interrupted**, and a pending action is shown as **uncertain**, because nobody knows whether it completed. This works without trusting process IDs, which the system can reuse. "Interrupted" is never written to the file. It is worked out each time a session is read, so a session that is running right now is never mislabelled.
+**Running or interrupted?** While a run is active, its process holds an exclusive lock (`flock`) on `session.lock`. The operating system releases the lock when the process ends in any way: normally, by a crash or by `kill -9`. So a session saved as running or verifying whose lock is free belongs to a process that is gone. It is shown as **interrupted**, and a pending action is shown as **uncertain**, because nobody knows whether it completed. This works without trusting process IDs, which the system can reuse. "Interrupted" is never written to the file. It is worked out each time a session is read, so a session that is running right now is never mislabelled.
 
 **Showing progress.** `sessions` lists every session with its status, steps, actions used of the limit, fix rounds, last update and task, plus any uncertain action. `show` gives one session in detail:
 - task, project and starting commit, model, used limits and stop reason;
@@ -508,6 +521,42 @@ Together with `task.json` (task details and steps), this is everything `show` di
 - the checks during the run, the errors and the changed files with their hashes;
 - the final verification;
 - with `--history`, the saved conversation.
+
+## Cancellation
+
+A running session can be cancelled with Ctrl+C in its own terminal, or with `python -m harness cancel <id>` from another one. Both lead to the same controlled stop.
+
+```mermaid
+sequenceDiagram
+    participant U as User (other terminal)
+    participant K as Linux kernel
+    participant H as Harness run
+    participant D as Docker
+    U->>K: cancel: who holds session.lock?
+    K-->>U: process 15038
+    U->>H: SIGTERM (Ctrl+C sends SIGINT)
+    alt waiting for the model or a check
+        H->>H: wait broken off at once
+        H->>D: docker rm --force (if a check was running)
+        D-->>H: container and all its processes removed
+    else in the middle of a step, e.g. an edit
+        H->>H: step completes, run stops before the next one
+    end
+    H->>H: session saved as cancelled, action in progress marked uncertain
+    U->>U: waits until the lock is free, shows the status
+```
+
+**Safe points.** While a run is going, the harness turns SIGINT (Ctrl+C) and SIGTERM (`cancel`) into a cancel request instead of letting them end the process:
+- **While waiting** for something it can drop (a model request or a running check), the wait is broken off at once.
+- **Anywhere else**, for example in the middle of a file edit, the request is only noted. The run stops before its next model request, action or finish check.
+
+So a cancel never leaves a half-written file. Once it is noted, no further action and no further write to the repository copy happens. A second Ctrl+C stops at once, as an escape hatch.
+
+**Child processes.** A check broken off by a cancel is cleaned up like a check that ran out of time: its container is removed with `docker rm --force`, which kills every process in it, including background children. The removal now sits in a `finally` block around both phases of a check, so it also happens if the cancel arrives while the container is still being created.
+
+**Saved state.** The session is saved as **cancelled**, with the reason (Ctrl+C or cancel command). An action that was in progress, such as a running check, is kept and shown as **uncertain**. No verification runs after a cancel, since that would mean running more commands in the sandbox. The task record stores the stop reason, and its result is "not verified" (neither passed nor failed). **Interrupted** is now only for a process that ended without a chance to save, such as a crash or `kill -9`.
+
+**Finding the process.** `cancel` does not trust the process ID saved in `session.json`; a changed file could otherwise make it signal any process. It asks the Linux kernel which process holds the session's lock (`/proc/locks`) and signals only that one. It then waits until that process has released the lock, and shows the final status.
 
 ## Protecting the working environment
 
@@ -536,7 +585,7 @@ flowchart LR
 
 - **Disposable copy.** Each run works on a fresh copy of the pristine clone. Before copying, the harness checks that the pristine clone is at the pinned commit and has no local changes.
 - **Contained execution.** Repository code and tests run only inside Docker, one container per check, with the restrictions shown above. The model can't send shell commands: it can only name a check from its project's `[projects.<name>.checks]`.
-- **Stoppable commands.** Each container is created first and then started with a time limit, so it always exists under a known name. When time runs out, `docker rm --force` removes it, which kills every process inside it, including background children. Pressing Ctrl+C during a check triggers the same cleanup.
+- **Stoppable commands.** Each container is created first and then started with a time limit, so it always exists under a known name. When time runs out, `docker rm --force` removes it, which kills every process inside it, including background children. A cancel (Ctrl+C or `cancel`) during a check triggers the same cleanup, in both phases of the check.
 - **Checks in application code.** Every request is validated before it runs: the tool exists, the arguments are complete, correctly typed and not too long, edits go only to the task's editable files, and only the agent's checks can run. All file paths pass through one check that rejects absolute paths, `..` escapes and symlinks pointing outside the copy.
 - **Git cannot be turned against the host.** The file tools block `.git`, and inside the container `/work/.git` is read-only. Git on the host runs with fsmonitor, hooks and external diff and textconv helpers disabled.
 - **Untrusted input.** Model replies are parsed and validated, never executed directly. The system prompt tells the model to treat file contents and command output as data, not instructions.
@@ -551,7 +600,7 @@ flowchart LR
 pytest
 ```
 
-All 242 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Six tests need more. Four need the pristine clone: the reference patch applies, navigation finds what the feature needs, file selection picks the editable files of both tasks, and the scripted feature run's edits fit the real code. Two need the pristine clone, Docker and the `cosmic-sandbox` image: the real reference check, and the real scripted feature run. They are skipped otherwise.
+All 254 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests and 1 cancellation test that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Six tests need more. Four need the pristine clone: the reference patch applies, navigation finds what the feature needs, file selection picks the editable files of both tasks, and the scripted feature run's edits fit the real code. Two need the pristine clone, Docker and the `cosmic-sandbox` image: the real reference check, and the real scripted feature run. They are skipped otherwise.
 
 | Handout test | Where |
 |---|---|
@@ -565,6 +614,7 @@ All 242 tests run without a model, an account or an API key. The controller test
 | Output limit | `test_output.py`, `test_controller.py`, `test_sandbox.py`: large output is bounded and marked `[output shortened: ...]` |
 | Task execution | `test_task_execution.py`: the task record holds request, starting commit, allowed changes, checks and limits; steps are on disk before the next model request; the record can be reopened after the run |
 | Session storage | `test_sessions.py`: a full run (refused request, failing check, fix, passing finish) is reopened with task details, steps, history, errors, check results, used limits and fingerprint; a separate Python process shows it with `show --history`; a harness process killed with `SIGKILL` during a check leaves an interrupted session with that check marked uncertain and the harness's own edit in the fingerprint; Ctrl+C does the same; a session in use shows as running and cannot be opened twice; IDs are found by unique parts, unsafe or ambiguous ones are refused |
+| Cancellation | `test_cancellation.py`: during a command, across processes, a stuck check in a separate harness process is stopped by `python -m harness cancel`; the check's whole process group is gone, the edit before it stays, the model's next edit never runs, and the session is cancelled with the check uncertain (a fake `docker` stands in, and with Docker present a real container is tested too). During a model request, the run stops within seconds instead of waiting. Ctrl+C between steps lets the current step finish and runs nothing more. A cancel during final verification is saved; second requests stop at once; `cancel` uses the kernel's lock holder, not the saved process ID |
 | Checks and loop | `test_task_execution.py`: scripted replies call `finish` too early, get the failing check output and a fix-round note, fix the code and finish; checks that never pass stop after the last fix round; unavailable checks stop at once and the run is never PASSED; `test_feature_task.py`: the scripted feature run needs exactly one fix round on the real code |
 | Bug fix | `test_runner.py`: with a fake sandbox in place of Docker, the acceptance check fails on the starting code and passes after the change, and existing tests still pass. The real check is shown by `baseline` and `run` (see Results) |
 | Feature | `test_feature_task.py`: the reference patch changes exactly the task's editable files and applies to the starting commit; with Docker, the real acceptance check fails on the starting code for the expected reason, passes with the reference solution, and the regression checks pass both times |
@@ -590,7 +640,7 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                242 automated tests
+tests/                254 automated tests
 acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
 tasks/                task files: invalid_quantity (Stage 1), batch_expiry (Stage 2)
 reference/            hand-written reference solutions, one patch per task, never shown to the agent

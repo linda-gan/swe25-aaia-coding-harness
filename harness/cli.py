@@ -7,6 +7,7 @@ the core modules (runner, projects, workspace).
     python -m harness baseline tasks/invalid_quantity.toml checks on the starting code
     python -m harness sessions                             saved sessions and their status
     python -m harness show <session id>                    one session in detail
+    python -m harness cancel <session id>                  stop a running session
 
 run and baseline take --project NAME; it must be allowed and match the task.
 
@@ -26,7 +27,7 @@ from harness.controller import Event, RunResult
 from harness.ollama_client import OllamaClient
 from harness.projects import TaskEntry, list_tasks, pristine_status, select_project
 from harness.runner import RunReport, check_task, effective_limits, make_sandbox, run_task
-from harness.session import INTERRUPTED, Session, SessionError, SessionStore
+from harness.session import CANCELLED, INTERRUPTED, Session, SessionError, SessionStore
 from harness.verification import VerificationReport, verify
 from harness.workspace import RUNS_DIR, WorkspaceError, create_project_copy, fetch_project
 
@@ -53,8 +54,10 @@ class Style:
     def yellow(self, t): return self._wrap("33", t)
     def cyan(self, t): return self._wrap("36", t)
 
-    def status(self, status: str) -> str:
-        label = status.upper()
+    def status(self, status: str, width: int = 0) -> str:
+        """PASSED in green, anything else in red. Padded before coloring, because
+        color codes would otherwise count as characters and break the columns."""
+        label = status.upper().ljust(width)
         return self.green(label) if status == "passed" else self.red(label)
 
 
@@ -111,16 +114,16 @@ def format_verification(style: Style, report: VerificationReport) -> str:
     width = max([12, *(len(check.name) for check in report.checks)])  # name column
     for check in report.checks:
         detail = check.error or last_line(check.output) or "(no output)"
-        lines.append(f"  {check.name:<{width}} {style.status(check.status):<8}  {detail}")
+        lines.append(f"  {check.name:<{width}} {style.status(check.status, 8)}  {detail}")
         if not check.passed and check.output.strip():
             # Failed, timed-out and unavailable checks show their output.
             lines.extend("      " + line for line in check.output.rstrip().splitlines())
 
     scope = report.scope
     if scope.passed:
-        lines.append(f"  {'scope':<{width}} {style.status('passed'):<8}  only editable files changed")
+        lines.append(f"  {'scope':<{width}} {style.status('passed', 8)}  only editable files changed")
     else:
-        lines.append(f"  {'scope':<{width}} {style.status('failed'):<8}  "
+        lines.append(f"  {'scope':<{width}} {style.status('failed', 8)}  "
                      f"changed outside the task: {', '.join(scope.outside)}")
 
     lines.append(heading(style, "Changed files"))
@@ -187,11 +190,12 @@ def format_projects(style: Style, config: HarnessConfig, statuses: dict[str, str
 
 
 STATUS_COLORS = {"passed": "green", "failed": "red", INTERRUPTED: "yellow",
-                 "running": "cyan", "verifying": "cyan"}
+                 CANCELLED: "yellow", "running": "cyan", "verifying": "cyan"}
 
 
-def color_status(style: Style, status: str) -> str:
-    return getattr(style, STATUS_COLORS.get(status, "bold"))(status)
+def color_status(style: Style, status: str, width: int = 0) -> str:
+    """Padded before coloring, so the columns stay aligned."""
+    return getattr(style, STATUS_COLORS.get(status, "bold"))(status.ljust(width))
 
 
 def format_sessions(style: Style, sessions: list[Session]) -> str:
@@ -205,7 +209,7 @@ def format_sessions(style: Style, sessions: list[Session]) -> str:
         counters = data["counters"]
         status = session.status
         lines.append(
-            f"{session.session_id:<24} {color_status(style, status):<12} "
+            f"{session.session_id:<24} {color_status(style, status, 12)} "
             f"{counters['steps']:>5} {str(counters['actions']) + '/' + str(limit):>8} "
             f"{counters['fix_rounds']:>4}  {data['updated_at']:<19}  {shown_path(data['task_file'])}"
         )
@@ -216,7 +220,12 @@ def format_sessions(style: Style, sessions: list[Session]) -> str:
 
 def describe_pending(pending: dict) -> str:
     target = f" {pending['target']}" if pending.get("target") else ""
-    return f"step {pending['step']} ({pending['tool']}{target}), started {pending['started_at']}"
+    text = f"{pending['tool']}{target}"
+    if pending.get("step") is not None:
+        text = f"step {pending['step']} ({text})"
+    if pending.get("started_at"):
+        text += f", started {pending['started_at']}"
+    return text
 
 
 def format_session(style: Style, session: Session, history: bool = False) -> str:
@@ -226,6 +235,8 @@ def format_session(style: Style, session: Session, history: bool = False) -> str
     limits = task.get("limits", {})
     lines = [style.bold(f"Session {session.session_id}")]
     lines.append(f"  Status:   {color_status(style, status)}")
+    if data.get("cancel_reason") and status == CANCELLED:
+        lines.append(f"  Cancelled by: {data['cancel_reason']}")
     if session.uncertain_action:
         lines.append(style.yellow(
             f"  Uncertain action: {describe_pending(session.uncertain_action)}. The run stopped "
@@ -261,11 +272,14 @@ def format_session(style: Style, session: Session, history: bool = False) -> str
         outcome = step.get("status") or ("ok" if step["ok"] else "error")
         line = f"  {step['step']:>3}  {step['phase']:<14} {step['tool']}{target}  [{outcome}]"
         lines.append(line if step["ok"] else style.red(line))
-    if data.get("pending_action"):
-        pending = data["pending_action"]
-        label = "UNCERTAIN" if status == INTERRUPTED else "running now"
-        lines.append(style.yellow(f"  {pending['step']:>3}  {label:<14} {pending['tool']}"
-                                  f"{' ' + pending['target'] if pending.get('target') else ''}"))
+    # A step that started but did not complete: running now, or uncertain.
+    open_step = session.uncertain_action or (data.get("pending_action")
+                                             if status in ("running", "verifying") else None)
+    if open_step:
+        label = "running now" if status in ("running", "verifying") else "UNCERTAIN"
+        number = open_step["step"] if open_step.get("step") is not None else "-"
+        lines.append(style.yellow(f"  {number:>3}  {label:<14} {open_step['tool']}"
+                                  f"{' ' + open_step['target'] if open_step.get('target') else ''}"))
 
     lines.append(heading(style, "Checks during the run"))
     if data["checks"]:
@@ -297,14 +311,15 @@ def format_session(style: Style, session: Session, history: bool = False) -> str
         width = max([12, *(len(c["name"]) for c in verification["checks"])])
         for check in verification["checks"]:
             detail = check["error"] or last_line(check["output_tail"]) or ""
-            lines.append(f"  {check['name']:<{width}} {style.status(check['status']):<8}  {detail}")
+            lines.append(f"  {check['name']:<{width}} {style.status(check['status'], 8)}  {detail}")
         scope = verification["scope"]
-        lines.append(f"  {'scope':<{width}} {style.status('passed' if scope['passed'] else 'failed'):<8}"
+        lines.append(f"  {'scope':<{width}} {style.status('passed' if scope['passed'] else 'failed', 8)}"
                      + ("" if scope["passed"] else f"  changed outside the task: {', '.join(scope['outside'])}"))
         lines.append(style.bold(style.green("  RESULT: PASSED") if verification["passed"]
                                 else style.red("  RESULT: FAILED")))
     else:
-        lines.append("  not run" + (" (the session was interrupted)" if status == INTERRUPTED else " yet"))
+        lines.append("  not run" + {INTERRUPTED: " (the session was interrupted)",
+                                     CANCELLED: " (the session was cancelled)"}.get(status, " yet"))
 
     lines.append(heading(style, "History"))
     messages = data["messages"]
@@ -340,6 +355,23 @@ def cmd_sessions(args, style: Style) -> int:
 def cmd_show(args, style: Style) -> int:
     session = SessionStore(args.runs_dir).open(args.session)
     print(format_session(style, session, history=args.history))
+    return EXIT_PASSED
+
+
+def cmd_cancel(args, style: Style) -> int:
+    store = SessionStore(args.runs_dir)
+    session = store.open(args.session)
+    pid = session.request_cancel()
+    print(f"Cancel requested for session {session.session_id} (process {pid}).")
+    print(f"Waiting up to {args.wait:g}s for it to stop at a safe point...")
+    if not session.wait_until_stopped(args.wait):
+        print(style.yellow("It has not stopped yet. Check again with: python -m harness sessions"))
+        return EXIT_FAILED
+    session = Session.load(session.run_dir)
+    print(f"Stopped. Status: {color_status(style, session.status)}")
+    if session.uncertain_action:
+        print(style.yellow(f"Uncertain action: {describe_pending(session.uncertain_action)}"))
+    print(f"Details: python -m harness show {session.session_id}")
     return EXIT_PASSED
 
 
@@ -390,6 +422,14 @@ def cmd_run(args, style: Style) -> int:
         raise
     print()
     print(format_agent(style, report.agent))
+    if report.cancelled:
+        print(style.yellow(f"Cancelled ({report.agent.stop_detail}). No further actions ran, "
+                           "and no verification was run."))
+        if report.agent.interrupted_action:
+            print(style.yellow("Uncertain action: "
+                               f"{describe_pending(report.agent.interrupted_action)}"))
+        print(f"Session: python -m harness show {run_copy.run_id}")
+        return EXIT_INTERRUPTED
     print(format_verification(style, report.verification))
     print()
     print(format_result(style, report))
@@ -457,6 +497,11 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("session", help="session ID, or a unique start or end of it")
     show.add_argument("--history", action="store_true", help="also list the saved conversation")
     show.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
+
+    cancel = sub.add_parser("cancel", help="stop a running session at its next safe point")
+    cancel.add_argument("session", help="session ID, or a unique start or end of it")
+    cancel.add_argument("--wait", type=float, default=60, help="seconds to wait for it to stop")
+    cancel.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
     return parser
 
 
@@ -465,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     style = Style()
     command = {
         "projects": cmd_projects, "fetch": cmd_fetch, "run": cmd_run, "baseline": cmd_baseline,
-        "sessions": cmd_sessions, "show": cmd_show,
+        "sessions": cmd_sessions, "show": cmd_show, "cancel": cmd_cancel,
     }[args.command]
     try:
         return command(args, style)

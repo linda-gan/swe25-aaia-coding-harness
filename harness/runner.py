@@ -13,13 +13,16 @@ from pathlib import Path
 from typing import Callable
 
 from harness.config import HarnessConfig, LimitsConfig, ProjectConfig, Task
-from harness.controller import AgentController, Event, RunResult
+from harness.cancellation import (
+    CancellableModel, CancellableSandbox, Cancelled, CancelToken, handle_signals,
+)
+from harness.controller import CANCELLED, AgentController, Event, RunResult
 from harness.repo_tools import RepositoryTools
 from harness.sandbox import DockerSandbox
 from harness.session import Session
 from harness.task_record import TaskRecord
 from harness.verification import VerificationReport, verify
-from harness.workspace import RunCopy
+from harness.workspace import RunCopy, diff
 
 # Checks whose command contains a path under this mount need the task's
 # acceptance folder.
@@ -32,7 +35,7 @@ class RunReport:
     run_copy: RunCopy
     model_name: str
     agent: RunResult
-    verification: VerificationReport
+    verification: VerificationReport | None  # None when the run was cancelled
     started_at: str = ""  # local date and time, ISO format
     finished_at: str = ""
     verification_seconds: float = 0.0
@@ -41,7 +44,11 @@ class RunReport:
     @property
     def passed(self) -> bool:
         """Decided only by the harness's own checks, never by the model."""
-        return self.verification.passed
+        return self.verification is not None and self.verification.passed
+
+    @property
+    def cancelled(self) -> bool:
+        return self.agent.stop_reason == CANCELLED
 
 
 def check_task(task: Task, project: ProjectConfig) -> None:
@@ -102,49 +109,68 @@ def run_task(
     limits = effective_limits(task, config.limits)
     # The session takes its lock first, so it shows as running from the start.
     session = Session.create(run_copy, task_path, project, model_name)
+    # Ctrl+C and `cancel` (SIGTERM) become a cancel request while the run goes.
+    token = CancelToken()
     try:
-        if on_session:
-            on_session(session)
-        # Saved before the agent starts, and updated after every step.
-        record = TaskRecord.create(run_copy, task, task_path, project, limits)
-        started_at = datetime.now().isoformat(timespec="seconds")
-        start = time.monotonic()
-        sandbox = make_sandbox(run_copy, project, task, sandbox_factory)
-        controller = AgentController(
-            model=model,
-            tools=RepositoryTools(run_copy.repo),
-            sandbox=sandbox,
-            task=task,
-            limits=limits,
-            on_event=on_event,
-            context=config.context,
-            on_step=record.add_step,
-            on_pending=session.pending,
-            on_checkpoint=session.checkpoint,
-        )
-        agent = controller.run()
-        # Verification always runs, whatever the reason the agent stopped.
-        session.verifying()
-        verification_start = time.monotonic()
-        verification = verify(sandbox, run_copy.repo, task)
-        end = time.monotonic()
-        report = RunReport(
-            task_path, run_copy, model_name, agent, verification,
-            started_at=started_at,
-            finished_at=datetime.now().isoformat(timespec="seconds"),
-            verification_seconds=round(end - verification_start, 1),
-            total_seconds=round(end - start, 1),
-        )
-        save_record(report, project)
-        record.finish(agent.stop_reason, agent.fix_rounds, report.passed,
-                      [{"name": c.name, "status": c.status} for c in verification.checks]
-                      + [{"name": "scope", "status": "passed" if verification.scope.passed
-                          else "failed"}])
-        session.finish(verification)
-        return report
+        with handle_signals(token):
+            if on_session:
+                on_session(session)
+            # Saved before the agent starts, and updated after every step.
+            record = TaskRecord.create(run_copy, task, task_path, project, limits)
+            started_at = datetime.now().isoformat(timespec="seconds")
+            start = time.monotonic()
+            sandbox = CancellableSandbox(make_sandbox(run_copy, project, task, sandbox_factory),
+                                         token)
+            controller = AgentController(
+                model=CancellableModel(model, token),
+                tools=RepositoryTools(run_copy.repo),
+                sandbox=sandbox,
+                task=task,
+                limits=limits,
+                on_event=on_event,
+                context=config.context,
+                on_step=record.add_step,
+                on_pending=session.pending,
+                on_checkpoint=session.checkpoint,
+                cancel=token,
+            )
+            agent = controller.run()
+            verification = None
+            if agent.stop_reason == CANCELLED:
+                session.cancelled(token.reason or agent.stop_detail, agent.interrupted_action)
+            else:
+                # Verification always runs, whatever other reason the agent stopped for.
+                session.verifying()
+                verification_start = time.monotonic()
+                try:
+                    verification = verify(sandbox, run_copy.repo, task)
+                except Cancelled as exc:
+                    agent.stop_reason, agent.stop_detail = CANCELLED, exc.reason
+                    session.cancelled(exc.reason, {"step": None, "action": None,
+                                                   "tool": "final verification",
+                                                   "target": ", ".join(task.final_checks)})
+            end = time.monotonic()
+            report = RunReport(
+                task_path, run_copy, model_name, agent, verification,
+                started_at=started_at,
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+                verification_seconds=(round(end - verification_start, 1)
+                                      if verification is not None else 0.0),
+                total_seconds=round(end - start, 1),
+            )
+            save_record(report, project)
+            final = ([{"name": c.name, "status": c.status} for c in verification.checks]
+                     + [{"name": "scope", "status": "passed" if verification.scope.passed
+                         else "failed"}]) if verification is not None else []
+            record.finish(agent.stop_reason, agent.fix_rounds,
+                          report.passed if verification is not None else None, final)
+            if verification is not None:
+                session.finish(verification)
+            return report
     finally:
-        # Also after Ctrl+C or an error: the lock is released, so the session
-        # then shows as interrupted, with any pending action marked uncertain.
+        # Also after an error or a forced stop: the lock is released. A session
+        # that was not saved as finished or cancelled then shows as interrupted,
+        # with any pending action marked uncertain.
         session.close()
 
 
@@ -176,7 +202,7 @@ def save_record(report: RunReport, project: ProjectConfig) -> Path:
             "events": [asdict(e) for e in agent.events],
             "messages": agent.messages,
         },
-        "verification": {
+        "verification": None if verification is None else {
             "checks": [
                 {"name": c.name, "status": c.status, "exit_code": c.exit_code,
                  "duration_seconds": round(c.duration_seconds, 2),
@@ -189,5 +215,7 @@ def save_record(report: RunReport, project: ProjectConfig) -> Path:
     }
     path = report.run_copy.run_dir / "run.json"
     path.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    (report.run_copy.run_dir / "changes.diff").write_text(verification.diff, encoding="utf-8")
+    # After a cancel there is no verification; the diff is read from the copy (Git, read-only).
+    changes = verification.diff if verification is not None else diff(report.run_copy.repo)
+    (report.run_copy.run_dir / "changes.diff").write_text(changes, encoding="utf-8")
     return path

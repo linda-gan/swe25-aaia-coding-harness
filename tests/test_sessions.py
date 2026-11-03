@@ -223,7 +223,9 @@ def test_pending_action_is_saved_before_the_action_runs(setup):
     assert Session.load(run_copy.run_dir).data["pending_action"] is None  # cleared afterwards
 
 
-def test_ctrl_c_during_a_check_leaves_an_interrupted_session(setup):
+def test_an_unhandled_stop_during_a_check_leaves_an_interrupted_session(setup):
+    # A KeyboardInterrupt raised directly (not through the run's signal handling,
+    # which turns Ctrl+C into a cancel) stands for a stop the harness cannot handle.
     run_copy = new_copy(setup)
 
     class InterruptedSandbox(FixAwareSandbox):

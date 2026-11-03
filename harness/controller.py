@@ -24,6 +24,12 @@ For sessions, on_pending is called just before an action or the finish
 checks run (so an interruption during it can be detected later), and
 on_checkpoint after every completed step and when the run stops. The
 controller itself never writes files.
+
+Cancellation: with a CancelToken, the controller stops before its next model
+request, action or finish check once a cancel was requested. A wait that the
+cancel broke off (model request or check) also ends the run. Either way the
+run stops as "cancelled", and an action that was in progress is kept as
+interrupted_action: it may or may not have completed.
 """
 from __future__ import annotations
 
@@ -33,6 +39,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from harness.actions import Action, ValidationError, normalize_path, tool_schemas, validate
+from harness.cancellation import CancelToken, Cancelled
 from harness.config import ContextConfig, LimitsConfig, Task
 from harness.context import ContextManager
 from harness.model import ModelClient, ModelError, ModelReply
@@ -50,6 +57,7 @@ NO_TOOL_CALL_NUDGE = (
 FINISHED = "finished"  # the model called finish and the agent checks passed
 CHECKS_FAILING = "checks still failing after the last fix round"
 CHECKS_UNAVAILABLE = "checks could not run"
+CANCELLED = "cancelled"
 ACTION_LIMIT = "action limit reached"
 DENIED_LIMIT = "too many refused actions"
 RETRY_LIMIT = "too many replies without a tool call"
@@ -76,6 +84,7 @@ class RunResult:
     steps: int = 0  # steps recorded: actions plus finish attempts
     stop_detail: str = ""  # e.g. the model error message
     checks: list[dict] = field(default_factory=list)  # every check run during the agent loop
+    interrupted_action: dict | None = None  # in progress when the run was cancelled
     duration_seconds: float = 0.0  # from the first model request to the stop
     messages: list[dict] = field(default_factory=list)  # full history, never shortened
     events: list[Event] = field(default_factory=list)
@@ -105,6 +114,7 @@ class AgentController:
         on_step: Callable[[dict], None] | None = None,
         on_pending: Callable[[dict], None] | None = None,
         on_checkpoint: Callable[[RunResult, dict], None] | None = None,
+        cancel: CancelToken | None = None,
     ):
         self.model = model
         self.tools = tools
@@ -118,6 +128,8 @@ class AgentController:
         self.on_step = on_step
         self.on_pending = on_pending
         self.on_checkpoint = on_checkpoint
+        self.cancel = cancel
+        self._current_pending: dict | None = None
         self.schemas = tool_schemas(task.agent_checks)
 
     # ---- the loop ----------------------------------------------------------
@@ -127,9 +139,22 @@ class AgentController:
         self.context = ContextManager(self.task, self.navigator, self.context_config, self.schemas,
                                       fix_rounds=self.limits.max_fix_rounds)
         run = RunResult(stop_reason="", messages=self.context.initial_messages())
-        retries_in_a_row = 0
+        try:
+            return self._loop(run)
+        except Cancelled as exc:
+            # Whatever was in progress may or may not have completed.
+            run.interrupted_action = self._current_pending
+            return self._stop(run, CANCELLED, exc.reason)
 
+    def _safe_point(self) -> None:
+        """Stop here if a cancel was requested: no further request, action or check."""
+        if self.cancel:
+            self.cancel.check()
+
+    def _loop(self, run: RunResult) -> RunResult:
+        retries_in_a_row = 0
         while True:
+            self._safe_point()
             # The model gets a prepared view; run.messages keeps the full history.
             view = self.context.view(run.messages)
             if self.context.last_compaction:
@@ -182,6 +207,7 @@ class AgentController:
                     break  # not finished: ignore any later calls in this reply, ask again
 
                 # 3. Enforce the action limit, then run the tool.
+                self._safe_point()
                 if run.actions >= self.limits.max_actions:
                     return self._stop(run, ACTION_LIMIT)
                 run.actions += 1
@@ -218,6 +244,7 @@ class AgentController:
         Returns the final RunResult when the run ends here, or None when the
         model gets another fix round.
         """
+        self._safe_point()
         if not self.task.agent_checks:
             self._record(run, None, ok=True, status="no agent checks", tool="finish")
             return self._stop(run, FINISHED, run.summary)
@@ -316,11 +343,13 @@ class AgentController:
 
     def _pending(self, run: RunResult, tool: str, target: str | None, action: int | None) -> None:
         """Announce the step that is about to run, before it runs."""
+        self._current_pending = {"step": run.steps + 1, "action": action, "tool": tool,
+                                 "target": target}
         if self.on_pending:
-            self.on_pending({"step": run.steps + 1, "action": action, "tool": tool,
-                             "target": target})
+            self.on_pending(dict(self._current_pending))
 
     def _checkpoint(self, run: RunResult) -> None:
+        self._current_pending = None  # the step is complete
         if self.on_checkpoint:
             self.on_checkpoint(run, self.context.state())
 

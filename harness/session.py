@@ -3,7 +3,7 @@
 A session is a run folder (workspace/runs/<id>/). Next to the task record
 (task.json) it holds session.json, the checkpoint:
 
-  status            running, verifying, passed or failed (as saved)
+  status            running, verifying, passed, failed or cancelled (as saved)
   counters          actions, refused actions, retries, fix rounds, steps:
                     the limits already used
   pending_action    the step that has started but not finished, or null
@@ -33,11 +33,14 @@ import hashlib
 import json
 import os
 import re
+import signal
+import time
 from collections import Counter
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+from harness.cancellation import lock_holder
 from harness.config import ProjectConfig
 from harness.task_record import RECORD_NAME, TaskRecord, write_json_atomic
 from harness.workspace import RUNS_DIR, RunCopy, changed_files, git
@@ -51,6 +54,7 @@ RUNNING = "running"  # the agent loop is going
 VERIFYING = "verifying"  # the harness is running the final checks
 PASSED = "passed"  # over: all final checks passed
 FAILED = "failed"  # over: at least one final check failed or could not run
+CANCELLED = "cancelled"  # stopped on request (Ctrl+C or cancel); no verification ran
 # Shown (never saved) for a running or verifying session whose process is gone
 INTERRUPTED = "interrupted"
 
@@ -101,6 +105,8 @@ class Session:
             "stop_detail": "",
             "counters": {"actions": 0, "denied": 0, "retries": 0, "fix_rounds": 0, "steps": 0},
             "pending_action": None,
+            "interrupted_action": None,
+            "cancel_reason": None,
             "context": None,
             "messages": [],
             "events": [],
@@ -144,6 +150,7 @@ class Session:
             "counters": {"actions": run.actions, "denied": run.denied, "retries": run.retries,
                          "fix_rounds": run.fix_rounds, "steps": run.steps},
             "pending_action": None,
+            "interrupted_action": run.interrupted_action,
             "context": context_state,
             "messages": run.messages,
             "events": [asdict(e) for e in run.events],
@@ -172,6 +179,15 @@ class Session:
                 "changed_files": verification.changed_files,
             },
         })
+        self.save()
+        self.close()
+
+    def cancelled(self, reason: str, interrupted_action: dict | None = None) -> None:
+        """Save the stop on request and release the session. No verification runs."""
+        self.data.update({"status": CANCELLED, "cancel_reason": reason, "updated_at": now(),
+                          "pending_action": None})
+        if interrupted_action is not None:
+            self.data["interrupted_action"] = interrupted_action
         self.save()
         self.close()
 
@@ -211,10 +227,44 @@ class Session:
 
     @property
     def uncertain_action(self) -> dict | None:
-        """The step that was running when the process ended, if any."""
-        if self.status == INTERRUPTED:
+        """The step that was in progress when the run was interrupted or cancelled.
+
+        It may or may not have completed, so it must never be replayed blindly.
+        """
+        status = self.status
+        if status == INTERRUPTED:
             return self.data.get("pending_action")
+        if status == CANCELLED:
+            return self.data.get("interrupted_action")
         return None
+
+    def request_cancel(self) -> int:
+        """Ask the process running this session to stop. Returns its process ID.
+
+        The process is found through the kernel (who holds the session lock),
+        not through the pid saved in session.json, so a changed file cannot
+        make this signal some other process. The harness then stops at its
+        next safe point, or at once if it is waiting for the model or a check.
+        """
+        status = self.status
+        if status not in (RUNNING, VERIFYING):
+            raise SessionError(f"Session {self.session_id} is not running (status: {status}).")
+        pid = lock_holder(self.run_dir / LOCK_FILE)
+        if pid is None:
+            raise SessionError(f"Could not find the process that runs session {self.session_id}.")
+        if pid == os.getpid():
+            raise SessionError("A session cannot cancel itself this way; use Ctrl+C.")
+        os.kill(pid, signal.SIGTERM)
+        return pid
+
+    def wait_until_stopped(self, timeout: float, poll: float = 0.2) -> bool:
+        """Wait until the running process has released the session. True if it did."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.is_active():
+                return True
+            time.sleep(poll)
+        return not self.is_active()
 
     def progress(self) -> dict[str, int]:
         """Steps per phase, in the order the phases first appeared."""

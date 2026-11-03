@@ -112,7 +112,7 @@ Check the setup:
 
 ```bash
 python -m harness projects      # the allowed project, its clone (should say "ready") and tasks
-pytest                          # 155 tests, no model needed
+pytest                          # 180 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -186,6 +186,8 @@ flowchart TB
     Client <-->|"HTTP /api/chat"| Ollama(["Ollama<br/>qwen3.6:35b"])
     Controller -->|"validate()"| Actions["Validation<br/>actions.py"]
     Controller -->|"list, read, search, edit"| Tools["RepositoryTools<br/>repo_tools.py"]
+    Controller -->|"find_symbol, outline,<br/>dependencies, git_status, git_diff"| Navigator["CodeNavigator<br/>navigation.py"]
+    Navigator -->|"paths checked"| Tools
     Controller -->|"run_check()"| Sandbox["DockerSandbox<br/>sandbox.py"]
     Tools --> Copy
     Sandbox -->|"docker create / start"| Container[["Docker container<br/>no network"]]
@@ -207,6 +209,7 @@ How the modules map to the handout's parts:
 | Controller | `controller.py`, `actions.py`, `prompts.py` | the agent loop; validation of every request; system prompt |
 | Model | `model.py`, `ollama_client.py` | model interface, scripted model for tests, Ollama client |
 | Repository tools | `repo_tools.py` | list, read, search and edit inside the run copy |
+| Navigation | `navigation.py` | symbols, file outlines and module dependencies (parsed with `ast`, never run); read-only Git status and diff |
 | Execution | `sandbox.py` | configured checks in a locked-down container; output and exit codes |
 | Limits | `controller.py`, `output.py`, `ollama_client.py` | action, refusal and retry limits; output limits; context limit |
 | Verification | `verification.py`, `workspace.py`, `runner.py` | final checks, scope check, diff, run record |
@@ -242,7 +245,15 @@ classDiagram
         +read_file(path) str
         +search(query, path) str
         +edit_file(path, old, new) str
-        -_resolve(path) Path
+        +resolve(path) Path
+        +files(path)
+    }
+    class CodeNavigator {
+        +find_symbol(name) str
+        +outline(path) str
+        +dependencies(path) str
+        +git_status() str
+        +git_diff(path) str
     }
     class DockerSandbox {
         +run_check(name) CheckResult
@@ -267,11 +278,25 @@ classDiagram
     ModelClient <|.. ScriptedModelClient
     AgentController --> ModelClient : asks for actions
     AgentController --> RepositoryTools : file actions
+    AgentController --> CodeNavigator : navigation
+    CodeNavigator --> RepositoryTools : same path checks
     AgentController --> DockerSandbox : agent checks
     AgentController ..> RunResult : returns
     DockerSandbox ..> CheckResult : returns
     VerificationReport --> CheckResult : final checks
 ```
+
+**Navigation tools.** Besides listing, reading, searching and editing, the model has five read-only tools:
+
+| Tool | Answers | Example on Cosmic Python |
+|---|---|---|
+| `find_symbol(name)` | where a class, function, method, field or module variable is defined | `batches` → `src/allocation/adapters/orm.py:36: variable batches = Table('batches', ...` |
+| `outline(path)` | what a Python file contains, with line numbers and signatures | `commands.py` → `class CreateBatch(Command) [@dataclass]` with its fields |
+| `dependencies(path)` | which repository modules a file imports, and which import it | `domain/model.py` is imported by `orm.py`, `repository.py`, `handlers.py` and tests |
+| `git_status()` | which files changed since the starting commit | `M  src/allocation/domain/commands.py` |
+| `git_diff(path)` | the changes so far, for everything or one path | the unified diff |
+
+They parse Python with the standard library's `ast` module: the source is read as data, and nothing from the repository is imported or run. Module names come from the folder layout (a folder belongs to a package if it has `__init__.py`), so `src/allocation/domain/model.py` is `allocation.domain.model`, and relative imports are resolved against it. A file that doesn't parse, for example after a broken edit, is reported in a note instead of stopping the tool. Paths go through the same checks as the file tools, and Git runs read-only commands with the same safe settings as the rest of the harness. `search` stays plain text on purpose: a regular expression from the model could make Python's regex engine run for a very long time. When a search finds nothing and the query looks like a pattern, the result says so and points to `find_symbol`.
 
 `verify()` in `verification.py` runs the final checks through the same `DockerSandbox` and builds the `VerificationReport`. `run_task()` in `runner.py` ties the controller and verification together and writes the run record.
 
@@ -347,11 +372,12 @@ flowchart LR
 pytest
 ```
 
-All 155 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Two feature tests need more: one needs the pristine clone, and one needs the pristine clone, Docker and the `cosmic-sandbox` image. They are skipped otherwise.
+All 180 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Three tests need more: two need the pristine clone (the reference patch applies, and navigation finds what the feature needs), and one needs the pristine clone, Docker and the `cosmic-sandbox` image. They are skipped otherwise.
 
 | Handout test | Where |
 |---|---|
 | File tools | `test_repo_tools.py`: read, search and edit; `../`, absolute paths, `.git` and escaping symlinks rejected |
+| Navigation | `test_navigation.py`: symbols, outlines and dependencies (relative and `TYPE_CHECKING` imports) on a small `src/`-layout repository; on the real target, the tools reach exactly the four files the feature may change; Git status and diff before and after an edit; same path checks; repository code is never run; the model can call every tool |
 | Controller | `test_controller.py`: a scripted `read_file` call runs, and the model receives its result |
 | Invalid request | `test_actions.py`, `test_controller.py`: unknown tools and invalid arguments give a clear error, and nothing runs |
 | Failed command | `test_sandbox.py`: a nonzero exit code and its output stay visible. `test_runner.py`: a model claiming success without a fix ends as FAILED |
@@ -370,7 +396,8 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 - One allowed project so far. The config and the commands support several, and the tests use a second, made-up project. Navigation, context management and sessions are still to come in Stage 2.
 - Context is protected only by a hard limit. A conversation that would exceed the model's context window stops the run instead of being summarized.
-- The `search` tool matches plain text. The model sometimes searched with regular expressions such as `qty.*0`, even though the tool description says plain text: once in a run with thinking on, three times in the run with thinking off. Those searches found nothing, but cost actions.
+- The `search` tool matches plain text. In Stage 1 the model sometimes searched with regular expressions such as `qty.*0`, even though the tool description says plain text: once in a run with thinking on, three times in the run with thinking off. Those searches found nothing, but cost actions. Regex search is still left out on purpose (see Navigation tools); instead, an empty result now explains this, and `find_symbol` covers the most common reason to search.
+- The navigation tools understand Python only, and find definitions by name, not every call site (`search` finds uses). Dynamic imports such as `importlib.import_module(name)` are not seen.
 - By design, the agent can't run the acceptance check: it sees only the task description and the unit tests.
 - Run time depends on hardware. With `qwen3.6:35b` partly in system RAM, a run took about 40 seconds.
 
@@ -378,7 +405,7 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                155 automated tests
+tests/                180 automated tests
 acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
 tasks/                task files: invalid_quantity (Stage 1), batch_expiry (Stage 2)
 reference/            hand-written reference solutions, one patch per task, never shown to the agent

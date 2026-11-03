@@ -12,6 +12,12 @@ MAX_SEARCH_RESULTS = 50
 MAX_LINE_CHARS = 200
 
 
+# Characters that suggest the model meant a regular expression. Search
+# deliberately has no regex mode: a pattern from the model could make Python's
+# regex engine run for a very long time (catastrophic backtracking).
+REGEX_HINTS = (".*", ".+", "\\", "^", "$", "|", "[", "(?")
+
+
 class ToolError(Exception):
     """A tool request was refused or failed. The message is shown to the model."""
 
@@ -41,6 +47,17 @@ class RepositoryTools:
         if self._is_blocked(resolved):
             raise ToolError(f"Access to this path is not allowed: {rel_path}")
         return resolved
+
+    def resolve(self, rel_path: str) -> Path:
+        """Public form of the path check, used by the navigation tools."""
+        return self._resolve(rel_path)
+
+    def files(self, path: str = "."):
+        """Allowed files under a path, in a stable order."""
+        start = self._resolve(path)
+        if not start.exists():
+            raise ToolError(f"No such file or directory: {path}")
+        return self._iter_files(start)
 
     def _is_blocked(self, absolute: Path) -> bool:
         return any(part in BLOCKED_DIRS for part in absolute.relative_to(self.root).parts)
@@ -109,7 +126,14 @@ class RepositoryTools:
                     if len(matches) >= MAX_SEARCH_RESULTS:
                         matches.append(f"[search shortened: stopped at {MAX_SEARCH_RESULTS} matches]")
                         return "\n".join(matches)
-        return "\n".join(matches) if matches else f"No matches for {query!r}."
+        if matches:
+            return "\n".join(matches)
+        result = f"No matches for {query!r}."
+        if any(hint in query for hint in REGEX_HINTS):
+            result += (" Note: search matches plain text, so characters such as .* | ^ $ [ ] "
+                       "are not patterns. Search for a plain word, or use find_symbol to find "
+                       "a definition.")
+        return result
 
     def edit_file(self, path: str, old: str, new: str) -> str:
         """Replace exactly one occurrence of old with new."""

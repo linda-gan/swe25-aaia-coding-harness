@@ -18,6 +18,7 @@ from typing import Callable
 from harness.actions import Action, ValidationError, tool_schemas, validate
 from harness.config import LimitsConfig, Task
 from harness.model import ModelClient, ModelError, ModelReply
+from harness.navigation import CodeNavigator
 from harness.output import shorten
 from harness.prompts import system_prompt
 from harness.repo_tools import RepositoryTools, ToolError
@@ -71,9 +72,12 @@ class AgentController:
         task: Task,
         limits: LimitsConfig,
         on_event: Callable[[Event], None] | None = None,
+        navigator: CodeNavigator | None = None,
     ):
         self.model = model
         self.tools = tools
+        # Symbols, outlines, dependencies and Git state, on the same files.
+        self.navigator = navigator or CodeNavigator(tools)
         self.sandbox = sandbox
         self.task = task
         self.limits = limits
@@ -162,6 +166,16 @@ class AgentController:
             return self.tools.read_file(args["path"])
         if action.name == "search":
             return self.tools.search(args["query"], args.get("path", "."))
+        if action.name == "find_symbol":
+            return self.navigator.find_symbol(args["name"])
+        if action.name == "outline":
+            return self.navigator.outline(args["path"])
+        if action.name == "dependencies":
+            return self.navigator.dependencies(args["path"])
+        if action.name == "git_status":
+            return self.navigator.git_status()
+        if action.name == "git_diff":
+            return self.navigator.git_diff(args.get("path", ""))
         if action.name == "edit_file":
             return self.tools.edit_file(args["path"], args["old"], args["new"])
         if action.name == "run_check":

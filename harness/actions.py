@@ -47,6 +47,28 @@ TOOLS: dict[str, ToolSpec] = {
         {"query": Param("Exact text to look for (case-sensitive, plain text, not a regular expression)."),
          "path": Param("File or folder to search. Default: whole repository.", required=False)},
     ),
+    "find_symbol": ToolSpec(
+        "Find where a class, function, method, field or module-level variable is "
+        "defined. Returns path:line, the kind and the signature.",
+        {"name": Param("Exact name, such as Batch, allocate or Product.allocate (case-sensitive).")},
+    ),
+    "outline": ToolSpec(
+        "Show the classes, methods, functions, fields and variables of one Python file, "
+        "with line numbers and signatures. Cheaper than reading the whole file.",
+        {"path": Param("Python file relative to the repository root.")},
+    ),
+    "dependencies": ToolSpec(
+        "Show which repository modules a Python file imports, and which modules import it.",
+        {"path": Param("Python file relative to the repository root.")},
+    ),
+    "git_status": ToolSpec(
+        "Show which files have changed since the starting commit.",
+        {},
+    ),
+    "git_diff": ToolSpec(
+        "Show your changes since the starting commit, for the whole repository or one path.",
+        {"path": Param("File or folder. Default: whole repository.", required=False)},
+    ),
     "edit_file": ToolSpec(
         "Replace text in a file. old must appear exactly once in the file.",
         {"path": Param("File path relative to the repository root."),

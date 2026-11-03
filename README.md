@@ -1,6 +1,6 @@
 # Coding Harness
 
-A small coding agent harness in Python, built for the AAIA semester project (Stage 1, Delivery 1). It takes a bug-fix task, lets a local language model change a disposable copy of a real repository through checked tools, verifies the result itself in a Docker sandbox, and shows the diff.
+A small coding agent harness in Python, built for the AAIA semester project (Stage 1 delivered; Stage 2 in progress). It takes a bug-fix or feature task, lets a local language model change a disposable copy of a real repository through checked tools, verifies the result itself in a Docker sandbox, and shows the diff.
 
 ```
 python -m harness run tasks/invalid_quantity.toml
@@ -23,6 +23,15 @@ Every real run with `qwen3.6:35b` passed. No manual help was given: the task fil
 In each run the acceptance check went from 2 failed, 1 passed to 3 passed, all 20 existing unit tests still passed, and only `src/allocation/service_layer/handlers.py` changed. The model's fixes differed slightly between runs (where the new exception sits, whether it checks `cmd.qty` or `line.qty`). That's expected, and is why the result is judged by tests, not by comparing code.
 
 With thinking off, each model reply is faster, but the agent took more steps: it repeated searches and tried regular expressions that plain-text search cannot match. Total time was about the same, but the run used 21 of its 30 allowed actions, against 14 to 15 with thinking on. Thinking stays on by default.
+
+**Stage 2, first real runs** (after the context step, before the edit-test-fix loop), with thinking on and no manual help:
+
+| Run | Task | Actions | Agent time | Stop reason | Result |
+|---|---|---|---|---|---|
+| `20261103-164853-9f8863` | `invalid_quantity` | 12 | 109.8 s | finished | PASSED |
+| `20261103-165247-037874` | `batch_expiry` | 30 of 30 | 217.5 s | action limit reached | PASSED |
+
+The feature run changed all four modules, including the database mapping, and every final check passed (acceptance 9 of 9). The model's design differs from the reference solution: it passes `today` into the domain model instead of reading the clock there. But the run hit the action limit just before calling `finish`. About 10 of its 30 actions were repeats: it read the four files twice at the start, and at the end it read them all again and re-ran both checks "to verify". The next step answered this. The harness now runs the checks itself at `finish`, and the prompt says that re-checking only to confirm isn't needed. The feature task also got its own limit of 40 actions.
 
 ## Target and task
 
@@ -112,7 +121,7 @@ Check the setup:
 
 ```bash
 python -m harness projects      # the allowed project, its clone (should say "ready") and tasks
-pytest                          # 203 tests, no model needed
+pytest                          # 226 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -135,6 +144,8 @@ python -m harness run tasks/batch_expiry.toml --project cosmicpython
 python -m harness run tasks/invalid_quantity.toml --no-think
 ```
 
+`python -m scripts.scripted_feature_run` shows the edit-test-fix loop on the feature task without a model (it needs Docker): a scripted "model" forgets the database mapping, the harness's checks at `finish` fail, the script fixes it in fix round 1, and the second `finish` passes.
+
 `run` prints the task, live progress for every step (thinking, action, result, refusals), the agent's stop reason, the harness's own verification, the changed files, the colored diff, a PASSED or FAILED result, and the timing.
 
 Each run gets its own folder, so runs never overwrite each other:
@@ -142,6 +153,8 @@ Each run gets its own folder, so runs never overwrite each other:
 ```
 workspace/runs/<date-time-id>/
   repo/          the copy the agent worked on
+  task.json      the task record: request, starting commit, allowed changes, checks,
+                 limits and every step, written at the start and after each step
   run.json       task, model, timing, every event and message, check results, diff
   changes.diff   the resulting diff
 ```
@@ -162,10 +175,10 @@ Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` i
 | `[projects.<name>.checks]` | the only commands that can run in that project's sandbox, by name: `unit_tests`, `acceptance`, `integration_sqlite` for `cosmicpython` |
 | `[sandbox]` | shared by all projects: 120 s time limit per check, 1 GB memory, 1 CPU, 8,000-character output limit |
 | `[context]` | what is sent to the model per request: 24,000-token limit, 6 newest results kept in full, 3,000-character repository map, outlines of 4 selected files in 4,000 characters (see Context management) |
-| `[limits]` | 30 actions, 10 refused actions, 3 replies in a row without a tool call, 6,000 characters of tool output per result |
+| `[limits]` | 30 actions by default (a task may set its own, up to a ceiling of 60), 10 refused actions, 3 replies in a row without a tool call, 3 fix rounds, 6,000 characters of tool output per result |
 | `[model]` | Ollama host, model name, thinking on or off, 32,768-token context, 600 s per reply |
 
-A task file in `tasks/` sets its `project`, the description, `editable_files`, `agent_checks`, `final_checks` and `acceptance_tests`.
+A task file in `tasks/` sets its `project`, the description, `editable_files`, `agent_checks`, `final_checks`, `acceptance_tests` and, optionally, its own `max_actions` (`batch_expiry` uses 40).
 
 **Allowed projects.** The harness works only on projects listed under `[projects.<name>]`. A run is refused before anything starts if the task's project is not listed, or if `--project` names a different project. Each entry holds everything that depends on the repository, so a second project could have its own commit, image and checks. Its pristine clone must lie inside `workspace/` (not in `workspace/runs/`), because `fetch` replaces that folder, and two projects can't share one. `fetch` clones into a temporary folder, checks out the pinned commit, removes the Git remote, checks the result and only then replaces the old clone. A clone that is already correct is left alone. The run record stores the project's name, URL and commit.
 
@@ -231,6 +244,8 @@ classDiagram
         +actions
         +denied
         +retries
+        +fix_rounds
+        +steps
         +finished bool
     }
     class ModelClient {
@@ -251,6 +266,12 @@ classDiagram
         +edit_file(path, old, new) str
         +resolve(path) Path
         +files(path)
+    }
+    class TaskRecord {
+        +create(run_copy, task, project, limits)
+        +add_step(step)
+        +finish(stop_reason, fix_rounds, passed)
+        +load(path)
     }
     class ContextManager {
         +initial_messages() list
@@ -295,6 +316,7 @@ classDiagram
     CodeNavigator --> RepositoryTools : same path checks
     AgentController --> DockerSandbox : agent checks
     AgentController ..> RunResult : returns
+    AgentController ..> TaskRecord : on_step, wired by the runner
     DockerSandbox ..> CheckResult : returns
     VerificationReport --> CheckResult : final checks
 ```
@@ -365,8 +387,13 @@ flowchart TD
     Retry --> Prepare
     HasCall -->|"yes"| Validate{"Valid request?<br/>known tool, correct arguments,<br/>allowed file or check"}
     Validate -->|"no"| Refuse["Return error to model, count refusal"]
-    Validate -->|"finish"| Done(["Stop: finished"])
-    Validate -->|"yes"| Limit{"30 actions reached?"}
+    Validate -->|"finish"| FinishChecks{"Harness runs the<br/>agent checks"}
+    FinishChecks -->|"all pass"| Done(["Stop: finished"])
+    FinishChecks -->|"one fails, fix rounds left"| FixRound["Send check output and a note:<br/>fix round N of 3"]
+    FixRound --> Prepare
+    FinishChecks -->|"still failing after 3 fix rounds"| StopFailing(["Stop: checks still failing"])
+    FinishChecks -->|"a check cannot run"| StopUnavailable(["Stop: checks could not run"])
+    Validate -->|"yes"| Limit{"Action limit reached?<br/>30, or the task's own"}
     Limit -->|"yes"| StopLimit(["Stop: action limit reached"])
     Limit -->|"no"| Run["Run tool, shorten output"]
     Run -->|"tool refuses, for example path outside repo"| Refuse
@@ -378,10 +405,40 @@ flowchart TD
     StopRetry --> Verify
     StopLimit --> Verify
     StopRefused --> Verify
+    StopFailing --> Verify
+    StopUnavailable --> Verify
     Verify --> Result(["PASSED or FAILED, diff, run record"])
 ```
 
-Every result and every error goes back to the model as a message, so it can react. The loop never decides whether the task succeeded: "finished" only means the model said it was done. Verification runs however the loop ended, and a run where the model claims success but the checks fail ends as FAILED.
+Every result and every error goes back to the model as a message, so it can react. The loop never decides whether the task succeeded: "finished" means the model said it was done and its agent checks then passed, but the hidden acceptance check and the scope check come only in verification. Verification runs however the loop ended, and a run where the model claims success but the checks fail ends as FAILED.
+
+## Task execution
+
+**The task record.** When a run starts, the harness writes `task.json` into the run folder, before the model is asked anything. It holds:
+- the request (the task description with its acceptance criteria) and the task file;
+- the project with its URL and pinned commit;
+- the starting commit, read from the run copy itself and compared with the pin;
+- the allowed changes (editable files);
+- the agent and final checks with the exact command of each, and the acceptance folder;
+- the limits that apply to this run.
+
+After every step, the record is saved again. Each save goes to a temporary file that then replaces the old one in one step (`os.replace`), so the file is always complete, also if the run is stopped unexpectedly. At the end, the harness adds the stop reason, the number of fix rounds and the final check results.
+
+**Task steps.** Every action and every finish attempt is a step. It records:
+- a number and a phase: exploring, editing, checking, finish checks, or fix round N for everything after the Nth failed finish;
+- the tool and its checked target (a path, check name or code name; never free text such as search queries);
+- the outcome and the time.
+
+The same step records feed the history summary in Context management.
+
+**The edit-test-fix loop.** The model edits and may run the agent checks whenever it likes. When it calls `finish`, the harness runs the agent checks itself. These runs don't count as actions.
+- **All pass:** the run is finished.
+- **One fails:** its output goes back to the model, marked as untrusted, followed by a trusted note from the harness ("Not finished yet ... fix round 1 of 3"), and the model continues. Calls after `finish` in the same reply are not run.
+- **Stopping rule:** the run ends when the checks pass at `finish`; or after 3 fix rounds, when the 4th failed `finish` stops it as "checks still failing"; or at once if a check cannot run at all ("checks could not run"), because retrying cannot help; or at one of the existing limits.
+
+Whatever the reason, verification then runs the final checks, including the hidden acceptance check, and decides PASSED or FAILED. A failed or unavailable check is never shown as passed.
+
+**Action limits per task.** The config's `max_actions = 30` is the default. A task file may set its own `max_actions`, up to `max_actions_ceiling = 60`. A higher value is refused before anything runs. `batch_expiry` sets 40, because the first real run needed more than 30 actions. The Stage 1 task keeps 30.
 
 ## Protecting the working environment
 
@@ -425,7 +482,7 @@ flowchart LR
 pytest
 ```
 
-All 203 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Four tests need more: three need the pristine clone (the reference patch applies, navigation finds what the feature needs, and file selection picks the editable files of both tasks), and one needs the pristine clone, Docker and the `cosmic-sandbox` image. They are skipped otherwise.
+All 226 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Six tests need more. Four need the pristine clone: the reference patch applies, navigation finds what the feature needs, file selection picks the editable files of both tasks, and the scripted feature run's edits fit the real code. Two need the pristine clone, Docker and the `cosmic-sandbox` image: the real reference check, and the real scripted feature run. They are skipped otherwise.
 
 | Handout test | Where |
 |---|---|
@@ -437,6 +494,8 @@ All 203 tests run without a model, an account or an API key. The controller test
 | Failed command | `test_sandbox.py`: a nonzero exit code and its output stay visible. `test_runner.py`: a model claiming success without a fix ends as FAILED |
 | Action limit | `test_controller.py`: a repeating scripted reply stops after the limit, and no further action runs |
 | Output limit | `test_output.py`, `test_controller.py`, `test_sandbox.py`: large output is bounded and marked `[output shortened: ...]` |
+| Task execution | `test_task_execution.py`: the task record holds request, starting commit, allowed changes, checks and limits; steps are on disk before the next model request; the record can be reopened after the run |
+| Checks and loop | `test_task_execution.py`: scripted replies call `finish` too early, get the failing check output and a fix-round note, fix the code and finish; checks that never pass stop after the last fix round; unavailable checks stop at once and the run is never PASSED; `test_feature_task.py`: the scripted feature run needs exactly one fix round on the real code |
 | Bug fix | `test_runner.py`: with a fake sandbox in place of Docker, the acceptance check fails on the starting code and passes after the change, and existing tests still pass. The real check is shown by `baseline` and `run` (see Results) |
 | Feature | `test_feature_task.py`: the reference patch changes exactly the task's editable files and applies to the starting commit; with Docker, the real acceptance check fails on the starting code for the expected reason, passes with the reference solution, and the regression checks pass both times |
 
@@ -460,7 +519,7 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                203 automated tests
+tests/                226 automated tests
 acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
 tasks/                task files: invalid_quantity (Stage 1), batch_expiry (Stage 2)
 reference/            hand-written reference solutions, one patch per task, never shown to the agent

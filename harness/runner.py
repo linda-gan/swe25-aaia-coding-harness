@@ -7,15 +7,16 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from harness.config import HarnessConfig, ProjectConfig, Task
+from harness.config import HarnessConfig, LimitsConfig, ProjectConfig, Task
 from harness.controller import AgentController, Event, RunResult
 from harness.repo_tools import RepositoryTools
 from harness.sandbox import DockerSandbox
+from harness.task_record import TaskRecord
 from harness.verification import VerificationReport, verify
 from harness.workspace import RunCopy
 
@@ -58,6 +59,18 @@ def check_task(task: Task, project: ProjectConfig) -> None:
             )
 
 
+def effective_limits(task: Task, limits: LimitsConfig) -> LimitsConfig:
+    """The config's limits, with the task's own action limit if it sets one."""
+    if task.max_actions is None:
+        return limits
+    if task.max_actions > limits.max_actions_ceiling:
+        raise ValueError(
+            f"The task sets max_actions = {task.max_actions}, above the ceiling of "
+            f"{limits.max_actions_ceiling} in config/target.toml."
+        )
+    return replace(limits, max_actions=task.max_actions)
+
+
 def uses_acceptance_mount(argv: list[str]) -> bool:
     return any(part == ACCEPTANCE_MOUNT or part.startswith(ACCEPTANCE_MOUNT + "/")
                for part in argv)
@@ -84,6 +97,9 @@ def run_task(
     sandbox_factory=DockerSandbox,
 ) -> RunReport:
     check_task(task, project)
+    limits = effective_limits(task, config.limits)
+    # Saved before the agent starts, and updated after every step.
+    record = TaskRecord.create(run_copy, task, task_path, project, limits)
     started_at = datetime.now().isoformat(timespec="seconds")
     start = time.monotonic()
     sandbox = make_sandbox(run_copy, project, task, sandbox_factory)
@@ -92,9 +108,10 @@ def run_task(
         tools=RepositoryTools(run_copy.repo),
         sandbox=sandbox,
         task=task,
-        limits=config.limits,
+        limits=limits,
         on_event=on_event,
         context=config.context,
+        on_step=record.add_step,
     )
     agent = controller.run()
     # Verification always runs, whatever the reason the agent stopped.
@@ -109,6 +126,10 @@ def run_task(
         total_seconds=round(end - start, 1),
     )
     save_record(report, project)
+    record.finish(agent.stop_reason, agent.fix_rounds, report.passed,
+                  [{"name": c.name, "status": c.status} for c in verification.checks]
+                  + [{"name": "scope", "status": "passed" if verification.scope.passed
+                      else "failed"}])
     return report
 
 
@@ -134,6 +155,8 @@ def save_record(report: RunReport, project: ProjectConfig) -> Path:
             "actions": agent.actions,
             "denied": agent.denied,
             "retries": agent.retries,
+            "fix_rounds": agent.fix_rounds,
+            "steps": agent.steps,
             "context": agent.context,
             "events": [asdict(e) for e in agent.events],
             "messages": agent.messages,

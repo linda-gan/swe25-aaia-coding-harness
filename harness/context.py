@@ -178,8 +178,9 @@ def build_repo_map(modules: dict[str, ModuleInfo], other_files: list[str], limit
 
 class ContextManager:
     def __init__(self, task: Task, navigator: CodeNavigator, config: ContextConfig,
-                 tool_schemas: list[dict], nonce: str | None = None):
+                 tool_schemas: list[dict], nonce: str | None = None, fix_rounds: int = 3):
         self.task = task
+        self.fix_rounds = fix_rounds
         self.navigator = navigator
         self.config = config
         self.tool_schemas = tool_schemas
@@ -195,7 +196,7 @@ class ContextManager:
 
     def initial_messages(self) -> list[dict]:
         return [
-            {"role": "system", "content": system_prompt(self.task, self.nonce)},
+            {"role": "system", "content": system_prompt(self.task, self.nonce, self.fix_rounds)},
             {"role": "user", "content": self.task.description},
             {"role": "user", "content": self.overview(),
              "harness_untrusted": "repository overview"},

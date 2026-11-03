@@ -20,6 +20,7 @@ from harness.controller import AgentController
 from harness.model import ScriptedModelClient, tool_reply
 from harness.navigation import CodeNavigator
 from harness.repo_tools import RepositoryTools
+from harness.sandbox import CheckResult
 from harness.workspace import create_project_copy
 
 NONCE = "c0ffee42"
@@ -268,8 +269,10 @@ def test_no_compaction_when_everything_fits(repo):
 # ---- through the controller ---------------------------------------------------------
 
 class NoSandbox:
+    """Only the harness's own checks at finish run here; they pass."""
+
     def run_check(self, name):
-        raise AssertionError("no check should run")
+        return CheckResult(name, ["pytest"], 0, "1 passed", False, 0.1, "fake")
 
 
 def test_controller_sends_views_within_the_limit_and_records_everything(repo):
@@ -303,7 +306,10 @@ def test_step_records_keep_validated_values_only(repo):
                           max_tool_output_chars=4000)
     run = AgentController(model, RepositoryTools(repo), NoSandbox(), TASK, limits).run()
     steps = [m["harness_step"] for m in run.messages if m["role"] == "tool"]
-    assert steps[0] == {"step": 1, "tool": "search", "target": None, "ok": True, "status": None}
+    elapsed = steps[0].pop("elapsed_seconds")
+    assert isinstance(elapsed, float)
+    assert steps[0] == {"step": 1, "action": 1, "phase": "exploring", "tool": "search",
+                        "target": None, "ok": True, "status": None}
     assert steps[1]["target"] == "src/shop/model.py"  # normalized path
     assert steps[2]["ok"] is False and steps[2]["status"] == "error"
     assert "IGNORE" not in json.dumps(steps)

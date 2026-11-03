@@ -4,10 +4,21 @@
                     ^                                      |
                     +------------ send result back --------+
 
-The loop stops when the model calls finish, or when a limit is reached:
-too many actions, too many refused actions, or too many replies in a row
-without a usable tool call. The controller never decides whether the task
-succeeded; the harness checks that separately afterwards.
+Edit-test-fix loop: when the model calls finish, the controller runs the
+task's agent checks itself. If they all pass, the run is finished. If one
+fails, its output goes back to the model with a note from the harness, and
+the model continues: one fix round. After max_fix_rounds failed rounds the
+run stops. If a check cannot run at all, the run stops at once.
+
+Other stopping rules: too many actions, too many refused actions, too many
+replies in a row without a usable tool call, a model error. Whatever the
+reason, the harness verifies the result separately afterwards; the
+controller never decides whether the task succeeded.
+
+Every action and every finish attempt is a step. Each step is attached to its
+tool result (for the context summary) and passed to on_step (for the task
+record), with its phase: exploring, editing, checking, finish checks, or
+fix round N for everything after the Nth failed finish.
 """
 from __future__ import annotations
 
@@ -31,7 +42,9 @@ NO_TOOL_CALL_NUDGE = (
 )
 
 # Why a run ended.
-FINISHED = "finished"
+FINISHED = "finished"  # the model called finish and the agent checks passed
+CHECKS_FAILING = "checks still failing after the last fix round"
+CHECKS_UNAVAILABLE = "checks could not run"
 ACTION_LIMIT = "action limit reached"
 DENIED_LIMIT = "too many refused actions"
 RETRY_LIMIT = "too many replies without a tool call"
@@ -42,7 +55,7 @@ INTERNAL_ERROR = "internal error"
 @dataclass(frozen=True)
 class Event:
     """One line of progress, for the interface to show and for the run log."""
-    kind: str  # thinking, model, action, result, refused, retry, stop
+    kind: str  # thinking, model, action, result, refused, retry, finish, check, context, stop
     message: str
     elapsed_seconds: float = 0.0  # since the agent run started
 
@@ -54,6 +67,8 @@ class RunResult:
     actions: int = 0  # tool calls that were attempted (finish not counted)
     denied: int = 0  # tool calls that were refused or failed
     retries: int = 0  # replies without a usable tool call
+    fix_rounds: int = 0  # finish attempts whose agent checks failed
+    steps: int = 0  # steps recorded: actions plus finish attempts
     duration_seconds: float = 0.0  # from the first model request to the stop
     messages: list[dict] = field(default_factory=list)  # full history, never shortened
     events: list[Event] = field(default_factory=list)
@@ -61,7 +76,11 @@ class RunResult:
 
     @property
     def finished(self) -> bool:
-        """True if the model said it was done. Says nothing about whether checks pass."""
+        """True if the model called finish and the agent checks then passed.
+
+        Says nothing about the final checks (such as the hidden acceptance
+        check), which the harness runs separately.
+        """
         return self.stop_reason == FINISHED
 
 
@@ -76,6 +95,7 @@ class AgentController:
         on_event: Callable[[Event], None] | None = None,
         navigator: CodeNavigator | None = None,
         context: ContextConfig | None = None,
+        on_step: Callable[[dict], None] | None = None,
     ):
         self.model = model
         self.tools = tools
@@ -86,13 +106,15 @@ class AgentController:
         self.task = task
         self.limits = limits
         self.on_event = on_event
+        self.on_step = on_step
         self.schemas = tool_schemas(task.agent_checks)
 
     # ---- the loop ----------------------------------------------------------
 
     def run(self) -> RunResult:
         self._start = time.monotonic()
-        self.context = ContextManager(self.task, self.navigator, self.context_config, self.schemas)
+        self.context = ContextManager(self.task, self.navigator, self.context_config, self.schemas,
+                                      fix_rounds=self.limits.max_fix_rounds)
         run = RunResult(stop_reason="", messages=self.context.initial_messages())
         retries_in_a_row = 0
 
@@ -133,15 +155,18 @@ class AgentController:
                     run.denied += 1
                     self._emit(run, "refused", f"{_short(call.name)}: {exc}")
                     self._add_tool_result(run, str(call.name), f"Error: {exc}",
-                                          _step(run, None, ok=False, status="refused"))
+                                          self._record(run, None, ok=False, status="refused"))
                     if run.denied > self.limits.max_denied_actions:
                         return self._stop(run, DENIED_LIMIT)
                     continue
 
-                # 2. finish ends the loop. It is not counted as an action.
+                # 2. finish: the harness runs the agent checks. Not counted as an action.
                 if action.name == "finish":
                     run.summary = action.arguments["summary"]
-                    return self._stop(run, FINISHED, run.summary)
+                    stop = self._finish_attempt(run)
+                    if stop:
+                        return stop
+                    break  # not finished: ignore any later calls in this reply, ask again
 
                 # 3. Enforce the action limit, then run the tool.
                 if run.actions >= self.limits.max_actions:
@@ -154,7 +179,7 @@ class AgentController:
                     run.denied += 1
                     self._emit(run, "refused", f"{action.name}: {exc}")
                     self._add_tool_result(run, action.name, f"Error: {exc}",
-                                          _step(run, action, ok=False, status="error"))
+                                          self._record(run, action, ok=False, status="error"))
                     if run.denied > self.limits.max_denied_actions:
                         return self._stop(run, DENIED_LIMIT)
                     continue
@@ -164,7 +189,52 @@ class AgentController:
                 self._emit(run, "result", output.splitlines()[0] if output else "(no output)")
                 status = self._check_status if action.name == "run_check" else None
                 self._add_tool_result(run, action.name, output,
-                                      _step(run, action, ok=True, status=status))
+                                      self._record(run, action, ok=True, status=status))
+
+    # ---- the edit-test-fix loop ---------------------------------------------
+
+    def _finish_attempt(self, run: RunResult) -> RunResult | None:
+        """Run the agent checks after a finish call.
+
+        Returns the final RunResult when the run ends here, or None when the
+        model gets another fix round.
+        """
+        if not self.task.agent_checks:
+            self._record(run, None, ok=True, status="no agent checks", tool="finish")
+            return self._stop(run, FINISHED, run.summary)
+
+        names = ", ".join(self.task.agent_checks)
+        self._emit(run, "finish", f"The model called finish. The harness runs: {names}")
+        results = [self.sandbox.run_check(name) for name in self.task.agent_checks]
+        for result in results:
+            self._emit(run, "check", f"{result.name} {result.status.upper()}")
+        passed = all(r.passed for r in results)
+        unavailable = [r.name for r in results if r.status == "unavailable"]
+        status = "passed" if passed else ("unavailable" if unavailable else "failed")
+        summary = ", ".join(f"{r.name} {r.status}" for r in results)
+        step = self._record(run, None, ok=passed, status=status, tool="finish",
+                            target=summary)
+
+        if passed:
+            return self._stop(run, FINISHED, run.summary)
+        output = "\n\n".join(format_check(r) for r in results)
+        self._add_tool_result(run, "finish", output, step)
+        if unavailable:
+            # Retrying cannot help when the checks cannot run at all.
+            return self._stop(run, CHECKS_UNAVAILABLE, ", ".join(unavailable))
+        run.fix_rounds += 1
+        if run.fix_rounds > self.limits.max_fix_rounds:
+            return self._stop(run, CHECKS_FAILING, summary)
+        # Trusted instruction from the harness; the check output above is untrusted.
+        run.messages.append({"role": "user", "content": (
+            f"Not finished yet: after your finish call the harness ran the checks "
+            f"({names}), and they did not all pass. The output is in the result above. "
+            f"Fix the problems, then call finish again. This is fix round "
+            f"{run.fix_rounds} of {self.limits.max_fix_rounds}."
+        )})
+        self._emit(run, "retry", f"Checks failed: fix round {run.fix_rounds} of "
+                                 f"{self.limits.max_fix_rounds}")
+        return None
 
     # ---- tools -------------------------------------------------------------
 
@@ -195,6 +265,37 @@ class AgentController:
         raise RuntimeError(f"No handler for validated action {action.name!r}")
 
     # ---- helpers -----------------------------------------------------------
+
+    def _record(self, run: RunResult, action: Action | None, ok: bool, status: str | None,
+                tool: str | None = None, target: str | None = None) -> dict:
+        """The harness's own record of one step: for the task record and the context summary.
+
+        Only validated values are kept: paths, check names and identifiers. Free
+        text such as search queries or edit contents is left out on purpose.
+        """
+        tool = tool or (action.name if action else "refused request")
+        if action is not None and target is None:
+            args = action.arguments
+            if action.name in PATH_TOOLS and "path" in args:
+                target = normalize_path(args["path"])[:200]
+            elif action.name == "run_check":
+                target = args["name"]  # validated against the task's checks
+            elif action.name == "find_symbol" and IDENTIFIER.fullmatch(args["name"].strip()):
+                target = args["name"].strip()
+        if run.fix_rounds:
+            phase = f"fix round {run.fix_rounds}"
+        elif tool == "finish":
+            phase = "finish checks"
+        else:
+            phase = {"edit_file": "editing", "run_check": "checking",
+                     "refused request": "refused"}.get(tool, "exploring")
+        run.steps += 1
+        step = {"step": run.steps, "action": run.actions if action else None, "phase": phase,
+                "tool": tool, "target": target, "ok": ok, "status": status,
+                "elapsed_seconds": round(time.monotonic() - self._start, 1)}
+        if self.on_step:
+            self.on_step(step)
+        return step
 
     def _add_tool_result(self, run: RunResult, name: str, content: str, step: dict) -> None:
         content = shorten(content, self.limits.max_tool_output_chars)
@@ -249,22 +350,3 @@ def _short(value, limit: int = 60) -> str:
 # Tools whose validated argument may appear in the harness's step records.
 PATH_TOOLS = {"list_files", "read_file", "outline", "dependencies", "git_diff", "edit_file"}
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
-
-
-def _step(run: RunResult, action: Action | None, ok: bool, status: str | None) -> dict:
-    """The harness's own record of one step, used for the history summary.
-
-    Only validated values are kept: paths, check names and identifiers. Free
-    text such as search queries or edit contents is left out on purpose.
-    """
-    target = None
-    if action is not None:
-        args = action.arguments
-        if action.name in PATH_TOOLS and "path" in args:
-            target = normalize_path(args["path"])[:200]
-        elif action.name == "run_check":
-            target = args["name"]  # validated against the task's checks
-        elif action.name == "find_symbol" and IDENTIFIER.fullmatch(args["name"].strip()):
-            target = args["name"].strip()
-    return {"step": run.actions, "tool": action.name if action else "refused request",
-            "target": target, "ok": ok, "status": status}

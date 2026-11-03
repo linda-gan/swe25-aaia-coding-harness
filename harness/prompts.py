@@ -13,9 +13,15 @@ How to work:
    matching changes in the modules that use it.
 2. Read a file before you edit it. edit_file replaces text that must appear
    exactly once in the file, so copy it exactly, including indentation.
-3. Run the available checks after your change and fix any failures.
-4. Review your work with git_status and git_diff, then call finish with a
-   short summary when the change is complete.
+3. Run the available checks while you work and fix any failures.
+4. When the change is complete, call finish with a short summary. The
+   harness then runs the checks ({agent_checks}) itself. If they pass, the
+   task is done. If not, you get their output and can fix the problems; this
+   can happen at most {fix_rounds} times. So there is no need to re-read
+   files or re-run checks only to confirm before you call finish.
+5. A file's content stays in the conversation after you read it. Read it
+   again only after you changed it in a way you need to see, or if its
+   result was replaced by a note. git_diff shows all your changes at once.
 
 Rules:
 - Paths are relative to the repository root.
@@ -33,10 +39,12 @@ Rules:
 """
 
 
-def system_prompt(task: Task, code: str = "CODE") -> str:
-    """code is the random marker code of this run (see harness/context.py)."""
+def system_prompt(task: Task, code: str = "CODE", fix_rounds: int = 3) -> str:
+    """code is the random marker code of this run (see harness/context.py);
+    fix_rounds is how often failing checks at finish give the model another try."""
     return SYSTEM_PROMPT.format(
         editable_files=", ".join(task.editable_files) or "none",
         agent_checks=", ".join(task.agent_checks) or "none",
         code=code,
+        fix_rounds=fix_rounds,
     )

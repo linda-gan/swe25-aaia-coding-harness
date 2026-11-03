@@ -7,6 +7,7 @@ the starting code and passes after the change).
 """
 import json
 import subprocess
+from dataclasses import replace
 
 import pytest
 
@@ -73,10 +74,16 @@ def config():
     return load_config()
 
 
+def project_for(run_copy, config):
+    """The project settings, pinned to the small test repository's commit."""
+    commit = git(run_copy.repo, "rev-parse", "HEAD").strip()
+    return replace(config.project("cosmicpython"), commit=commit)
+
+
 def run(run_copy, config, replies, sandbox_factory=FakeSandbox):
     return run_task(
         task=TASK, task_path="tasks/test.toml", config=config,
-        project=config.project("cosmicpython"),
+        project=project_for(run_copy, config),
         model=ScriptedModelClient(replies), model_name="scripted",
         run_copy=run_copy, sandbox_factory=sandbox_factory,
     )
@@ -117,7 +124,8 @@ def test_model_says_done_without_fixing_and_run_is_failed(run_copy, config):
     text = format_verification(Style(False), report.verification) + format_result(Style(False), report)
     assert "acceptance   FAILED" in text
     assert "2 failed, 1 passed" in text  # the failing output stays visible
-    assert "the model reported the task as done, but the checks did not pass" in text
+    assert "the model reported the task as done and its own checks passed" in text
+    assert "but the final checks did not pass" in text
     assert "RESULT: FAILED" in text
 
 
@@ -138,7 +146,7 @@ def test_verification_runs_even_when_the_agent_hits_a_limit(run_copy, config):
 
     model = ScriptedModelClient([tool_reply("list_files")], repeat_last=True)
     report = run_task(task=TASK, task_path="t", config=config,
-                      project=config.project("cosmicpython"), model=model, model_name="s",
+                      project=project_for(run_copy, config), model=model, model_name="s",
                       run_copy=run_copy, sandbox_factory=factory)
     assert report.agent.stop_reason == "action limit reached"
     assert sandbox_holder["s"].ran == ["acceptance", "unit_tests"]

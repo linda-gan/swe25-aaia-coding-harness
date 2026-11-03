@@ -35,9 +35,11 @@ cpus = "1"
 max_output_chars = 8000
 
 [limits]
-max_actions = 30            # tool calls per run
+max_actions = 30            # tool calls per run (a task file may set its own)
+max_actions_ceiling = 60    # the most a task file may set
 max_denied_actions = 10     # refused or failed tool calls per run
 max_retries = 3             # replies in a row without a usable tool call
+max_fix_rounds = 3          # finish attempts whose checks fail before the run stops
 max_tool_output_chars = 6000
 
 # What is sent to the model per request (see "Context" in the README).

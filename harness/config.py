@@ -35,10 +35,12 @@ class SandboxConfig:
 
 @dataclass(frozen=True)
 class LimitsConfig:
-    max_actions: int
+    max_actions: int  # default for every task; a task file may set its own
     max_denied_actions: int
     max_retries: int
     max_tool_output_chars: int
+    max_fix_rounds: int = 3  # finish attempts with failing checks before the run stops
+    max_actions_ceiling: int = 60  # a task file may not set max_actions above this
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,9 @@ class Task:
     # The project the task belongs to. Required in task files; whether it is
     # allowed is decided against the config when a run starts.
     project: str | None = None
+    # Optional action limit for this task, instead of the config's default.
+    # It may not exceed [limits] max_actions_ceiling (checked when a run starts).
+    max_actions: int | None = None
 
 
 def _read(path: Path) -> dict:
@@ -137,9 +142,14 @@ def _build_config(data: dict, workspace_dir: Path) -> HarnessConfig:
                                                 int(model.num_ctx * CONTEXT_SAFETY)))
     context = ContextConfig(**context_values)
     _check_context(context, model)
+    limits = LimitsConfig(**data["limits"])
+    if not 0 < limits.max_actions <= limits.max_actions_ceiling:
+        raise ValueError("[limits] max_actions must be between 1 and max_actions_ceiling.")
+    if limits.max_fix_rounds < 0:
+        raise ValueError("[limits] max_fix_rounds must not be negative.")
     return HarnessConfig(
         projects=projects,
-        limits=LimitsConfig(**data["limits"]),
+        limits=limits,
         model=model,
         context=context,
     )
@@ -224,12 +234,17 @@ def load_task(path: Path | str, acceptance_root: Path = ACCEPTANCE_ROOT) -> Task
             final_checks=list(data["final_checks"]),
             acceptance_dir=_acceptance_dir(path, data.get("acceptance_tests"), acceptance_root),
             project=data["project"],
+            max_actions=data.get("max_actions"),
         )
     except (KeyError, TypeError, AttributeError) as exc:
         raise ValueError(f"{path}: missing or unexpected setting ({exc}).") from None
     if not isinstance(task.project, str) or not FOLDER_NAME.fullmatch(task.project):
         raise ValueError(f"{path}: project must be the plain name of a project, "
                          f"such as \"cosmicpython\" (got {task.project!r}).")
+    if task.max_actions is not None and (
+            isinstance(task.max_actions, bool) or not isinstance(task.max_actions, int)
+            or task.max_actions < 1):
+        raise ValueError(f"{path}: max_actions must be a positive whole number.")
     if not task.description:
         raise ValueError(f"Task {path} has an empty description.")
     if not task.final_checks:

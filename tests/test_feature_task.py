@@ -219,3 +219,35 @@ def test_real_acceptance_fails_on_starting_code_and_passes_with_reference(tmp_pa
     assert [c.status for c in result.after.checks] == ["passed", "passed", "passed"]
     assert result.after.scope.passed
     assert result.ok
+
+
+# ---- the scripted feature run (edit-test-fix loop on the real code) ----------
+
+class FeatureAwareSandbox:
+    """Stands in for Docker: the SQLite tests fail until orm.py stores the expiry
+    date, as the real ones do; other checks pass."""
+
+    def __init__(self, repo, *args, **kwargs):
+        self.repo = repo
+
+    def run_check(self, name):
+        orm = (self.repo / "src/allocation/adapters/orm.py").read_text()
+        ok = name != "integration_sqlite" or 'Column("expires"' in orm
+        return CheckResult(name, ["pytest"], 0 if ok else 1,
+                           "6 passed" if ok else "3 failed, 3 passed", False, 0.1, "fake")
+
+
+@needs_pristine
+def test_scripted_feature_run_edits_fit_the_real_code_and_need_one_fix_round(tmp_path, capsys):
+    from scripts.scripted_feature_run import main
+    assert main(sandbox_factory=FeatureAwareSandbox, runs_dir=tmp_path / "runs") == 0
+    out = capsys.readouterr().out
+    assert "integration_sqlite FAILED" in out and "fix round 1 of 3" in out
+    assert "1 fix rounds" in out
+
+
+@needs_sandbox
+def test_real_scripted_feature_run_passes_after_one_fix_round(tmp_path, capsys):
+    from scripts.scripted_feature_run import main
+    assert main(runs_dir=tmp_path / "runs") == 0
+    assert "acceptance         PASSED" in capsys.readouterr().out

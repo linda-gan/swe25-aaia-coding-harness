@@ -23,7 +23,7 @@ from harness.config import PROJECT_ROOT, HarnessConfig, load_config, load_task
 from harness.controller import Event, RunResult
 from harness.ollama_client import OllamaClient
 from harness.projects import TaskEntry, list_tasks, pristine_status, select_project
-from harness.runner import RunReport, check_task, make_sandbox, run_task
+from harness.runner import RunReport, check_task, effective_limits, make_sandbox, run_task
 from harness.verification import VerificationReport, verify
 from harness.workspace import WorkspaceError, create_project_copy, fetch_project
 
@@ -55,7 +55,8 @@ class Style:
         return self.green(label) if status == "passed" else self.red(label)
 
 
-EVENT_COLORS = {"thinking": "dim", "refused": "red", "retry": "yellow", "stop": "bold"}
+EVENT_COLORS = {"thinking": "dim", "refused": "red", "retry": "yellow", "stop": "bold",
+                "finish": "cyan", "check": "cyan", "context": "yellow"}
 
 
 # ---- formatting --------------------------------------------------------------
@@ -74,7 +75,7 @@ def format_agent(style: Style, agent: RunResult) -> str:
     lines = [
         f"Agent stopped: {style.bold(agent.stop_reason)} "
         f"({agent.actions} actions, {agent.denied} refused, {agent.retries} retries, "
-        f"{agent.duration_seconds:.1f}s)"
+        f"{agent.fix_rounds} fix rounds, {agent.duration_seconds:.1f}s)"
     ]
     if agent.summary:
         lines.append(f"Model's summary: {agent.summary}")
@@ -134,7 +135,8 @@ def format_result(style: Style, report: RunReport) -> str:
     lines = []
     if report.agent.finished and not report.passed:
         lines.append(style.yellow(
-            "Note: the model reported the task as done, but the checks did not pass."))
+            "Note: the model reported the task as done and its own checks passed, "
+            "but the final checks did not pass."))
     if not report.agent.finished:
         lines.append(style.yellow(
             f"Note: the agent did not finish ({report.agent.stop_reason}). "
@@ -189,6 +191,7 @@ def prepare(args):
     task = load_task(args.task)
     project = select_project(config, task, args.project)
     check_task(task, project)
+    effective_limits(task, config.limits)  # refuses a task limit above the ceiling
     return config, task, project
 
 
@@ -223,6 +226,9 @@ def cmd_run(args, style: Style) -> int:
     print(f"  Task:    {args.task}")
     print(f"  Project: {project.name} ({project.url} @ {project.commit[:12]})")
     print(f"  Copy:    {run_copy.repo}")
+    limits = effective_limits(task, config.limits)
+    print(f"  Limits:  {limits.max_actions} actions, {limits.max_fix_rounds} fix rounds")
+    print(f"  Record:  {run_copy.run_dir / 'task.json'}")
     print(f"  Model:   {model_config.name} (thinking {'on' if model_config.think else 'off'})")
     print(heading(style, "Task"))
     print(task.description)

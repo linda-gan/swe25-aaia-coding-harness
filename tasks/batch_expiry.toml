@@ -39,6 +39,10 @@ editable_files = [
 # Hidden from the agent; the harness runs them after the agent stops.
 acceptance_tests = "batch_expiry"
 
+# Four modules to change: more actions than the default of 30. The first real
+# run used 30 and passed, but ran out just before calling finish.
+max_actions = 40
+
 # Checks the agent may run itself: the existing unit tests and the
 # integration tests on SQLite, which also cover the database mapping.
 agent_checks = ["unit_tests", "integration_sqlite"]

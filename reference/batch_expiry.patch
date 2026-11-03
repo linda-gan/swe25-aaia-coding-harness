@@ -1,0 +1,90 @@
+diff --git a/src/allocation/adapters/orm.py b/src/allocation/adapters/orm.py
+index 81d704c..20af68b 100644
+--- a/src/allocation/adapters/orm.py
++++ b/src/allocation/adapters/orm.py
+@@ -41,6 +41,7 @@ batches = Table(
+     Column("sku", ForeignKey("products.sku")),
+     Column("_purchased_quantity", Integer, nullable=False),
+     Column("eta", Date, nullable=True),
++    Column("expires", Date, nullable=True),
+ )
+ 
+ allocations = Table(
+diff --git a/src/allocation/domain/commands.py b/src/allocation/domain/commands.py
+index 5473eff..a0ab9ca 100644
+--- a/src/allocation/domain/commands.py
++++ b/src/allocation/domain/commands.py
+@@ -21,6 +21,7 @@ class CreateBatch(Command):
+     sku: str
+     qty: int
+     eta: Optional[date] = None
++    expires: Optional[date] = None
+ 
+ 
+ @dataclass
+diff --git a/src/allocation/domain/model.py b/src/allocation/domain/model.py
+index dd4ac78..f333678 100644
+--- a/src/allocation/domain/model.py
++++ b/src/allocation/domain/model.py
+@@ -46,10 +46,14 @@ class OrderLine:
+ 
+ 
+ class Batch:
+-    def __init__(self, ref: str, sku: str, qty: int, eta: Optional[date]):
++    def __init__(
++        self, ref: str, sku: str, qty: int, eta: Optional[date],
++        expires: Optional[date] = None,
++    ):
+         self.reference = ref
+         self.sku = sku
+         self.eta = eta
++        self.expires = expires
+         self._purchased_quantity = qty
+         self._allocations = set()  # type: Set[OrderLine]
+ 
+@@ -86,5 +90,12 @@ class Batch:
+     def available_quantity(self) -> int:
+         return self._purchased_quantity - self.allocated_quantity
+ 
++    def is_expired(self, today: date) -> bool:
++        return self.expires is not None and self.expires < today
++
+     def can_allocate(self, line: OrderLine) -> bool:
+-        return self.sku == line.sku and self.available_quantity >= line.qty
++        return (
++            self.sku == line.sku
++            and self.available_quantity >= line.qty
++            and not self.is_expired(date.today())
++        )
+diff --git a/src/allocation/service_layer/handlers.py b/src/allocation/service_layer/handlers.py
+index 2d7aa8d..9e90d34 100644
+--- a/src/allocation/service_layer/handlers.py
++++ b/src/allocation/service_layer/handlers.py
+@@ -14,16 +14,26 @@ class InvalidSku(Exception):
+     pass
+ 
+ 
++class InvalidExpiry(Exception):
++    pass
++
++
+ def add_batch(
+     cmd: commands.CreateBatch,
+     uow: unit_of_work.AbstractUnitOfWork,
+ ):
++    if cmd.expires is not None and cmd.eta is not None and cmd.expires < cmd.eta:
++        raise InvalidExpiry(
++            f"Batch {cmd.ref} expires on {cmd.expires}, before it arrives on {cmd.eta}"
++        )
+     with uow:
+         product = uow.products.get(sku=cmd.sku)
+         if product is None:
+             product = model.Product(cmd.sku, batches=[])
+             uow.products.add(product)
+-        product.batches.append(model.Batch(cmd.ref, cmd.sku, cmd.qty, cmd.eta))
++        product.batches.append(
++            model.Batch(cmd.ref, cmd.sku, cmd.qty, cmd.eta, cmd.expires)
++        )
+         uow.commit()
+ 
+ 

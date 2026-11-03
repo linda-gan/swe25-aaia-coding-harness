@@ -98,18 +98,19 @@ def format_diff(style: Style, diff_text: str) -> str:
 
 def format_verification(style: Style, report: VerificationReport) -> str:
     lines = [heading(style, "Verification (run by the harness, not the model)")]
+    width = max([12, *(len(check.name) for check in report.checks)])  # name column
     for check in report.checks:
         detail = check.error or last_line(check.output) or "(no output)"
-        lines.append(f"  {check.name:<12} {style.status(check.status):<8}  {detail}")
+        lines.append(f"  {check.name:<{width}} {style.status(check.status):<8}  {detail}")
         if not check.passed and check.output.strip():
             # Failed, timed-out and unavailable checks show their output.
             lines.extend("      " + line for line in check.output.rstrip().splitlines())
 
     scope = report.scope
     if scope.passed:
-        lines.append(f"  {'scope':<12} {style.status('passed'):<8}  only editable files changed")
+        lines.append(f"  {'scope':<{width}} {style.status('passed'):<8}  only editable files changed")
     else:
-        lines.append(f"  {'scope':<12} {style.status('failed'):<8}  "
+        lines.append(f"  {'scope':<{width}} {style.status('failed'):<8}  "
                      f"changed outside the task: {', '.join(scope.outside)}")
 
     lines.append(heading(style, "Changed files"))

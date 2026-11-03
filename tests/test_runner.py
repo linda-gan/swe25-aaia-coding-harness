@@ -181,3 +181,13 @@ def test_task_with_unknown_check_is_refused_early(config):
     bad = Task("x", ["a.py"], ["unit_tests"], ["integration"])
     with pytest.raises(ValueError, match="'integration'"):
         check_task(bad, config)
+
+
+def test_check_names_longer_than_the_column_stay_aligned(run_copy):
+    from harness.verification import ScopeResult, VerificationReport
+    checks = [CheckResult(name, ["pytest"], 0, "ok", False, 0.1, "fake")
+              for name in ["acceptance", "integration_sqlite"]]
+    report = VerificationReport(checks, ScopeResult(True, [], []), "", [])
+    rows = [line for line in format_verification(Style(False), report).splitlines()
+            if "PASSED" in line]
+    assert len({row.index("PASSED") for row in rows}) == 1  # one column for all rows

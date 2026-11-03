@@ -86,6 +86,19 @@ def create_run_copy(
     return RunCopy(run_id=run_id, run_dir=run_dir, repo=repo)
 
 
+def apply_patch(repo: Path, patch: Path) -> None:
+    """Apply a patch to a run copy, all or nothing.
+
+    Used for reference solutions, never for model output. "git apply --check"
+    runs first, so a patch that does not fit changes nothing.
+    """
+    patch = Path(patch).resolve()
+    if not patch.is_file():
+        raise WorkspaceError(f"Patch not found: {patch}")
+    git(repo, "apply", "--check", str(patch))
+    git(repo, "apply", str(patch))
+
+
 def diff(repo: Path) -> str:
     """Changes to tracked files, compared with the starting commit."""
     # --no-ext-diff and --no-textconv: never run diff helper programs.

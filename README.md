@@ -50,6 +50,39 @@ acceptance   FAILED    2 failed, 1 passed
 unit_tests   PASSED    20 passed
 ```
 
+### Stage 2 feature: batch expiry
+
+**The feature** (`tasks/batch_expiry.toml`): batches get an optional expiry date, for perishable stock.
+
+- `CreateBatch` gets an optional `expires` date (default `None`). Batches without one never expire, so existing calls keep working.
+- A batch can be allocated up to and including its expiry date. After that, allocation skips it; with no other batch, the product is out of stock as before.
+- An expiry date earlier than the batch's ETA is rejected with a new `InvalidExpiry` exception, and the batch is not added.
+- The expiry date is stored in the database with the batch.
+
+It spans four interacting modules: the command (`domain/commands.py`), the domain rules (`domain/model.py`), the service layer (`service_layer/handlers.py`) and the database mapping (`adapters/orm.py`). The task description names behavior, not files (except `handlers.py`, where the exception must live), so the agent has to find the modules itself.
+
+- Files that may change: the four modules above
+- Checks the agent may run itself: `unit_tests`, `integration_sqlite`
+- Checks the harness runs afterwards: `acceptance`, `unit_tests`, `integration_sqlite`
+
+**Why the database mapping matters.** SQLAlchemy loads a `Batch` from the database without calling `__init__`, so an expiry date that exists only in the domain model is missing on every loaded batch. A change that forgets `orm.py` breaks 3 of the existing SQLite integration tests. The agent can run that check, so a failing check guides it to the missing part without revealing the acceptance test.
+
+**The acceptance check** (`acceptance/batch_expiry/`, 9 tests) uses only commands, the message bus and the read model, with its own fakes. Two of its tests check that calls without an expiry date behave as before; they pass on the starting code. It was tested against four plausible wrong solutions, and each one fails exactly one test: no database column, no column but a `getattr` default, expiry counted one day early, and validation after the batch was already added.
+
+**The reference solution** (`reference/batch_expiry.patch`) is a hand-written patch that shows the checks can pass. It is kept outside the run copy and outside the mounted acceptance folder, and the agent never sees it. `python -m scripts.check_reference tasks/batch_expiry.toml` runs the final checks on one fresh copy, first on the starting code, then with the patch applied (output shortened):
+
+```text
+1. Starting code
+acceptance         FAILED    7 failed, 2 passed
+  TypeError: CreateBatch.__init__() got an unexpected keyword argument 'expires'
+unit_tests         PASSED    20 passed
+integration_sqlite PASSED    6 passed, 1 deselected
+2. With the reference solution
+acceptance         PASSED    9 passed
+unit_tests         PASSED    20 passed
+integration_sqlite PASSED    6 passed, 1 deselected
+```
+
 ## Requirements
 
 - Windows 11 with WSL 2 (Ubuntu), or Linux. Developed and tested on Windows 11 with WSL 2 using mirrored networking.
@@ -78,7 +111,7 @@ ollama pull qwen3.6:35b
 Check the setup:
 
 ```bash
-pytest                          # 106 tests, no model needed
+pytest                          # 120 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -109,6 +142,8 @@ workspace/runs/<date-time-id>/
 Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` interrupted with Ctrl+C.
 
 `python -m scripts.scripted_run <repo copy>` runs the whole pipeline with a scripted model that applies the known fix. It's useful for checking the tools and sandbox without a real model.
+
+`python -m scripts.check_reference <task file>` checks a task's acceptance tests without a model: they must fail on the starting code and pass with the task's reference solution from `reference/`.
 
 ## Configuration
 
@@ -299,7 +334,7 @@ flowchart LR
 pytest
 ```
 
-All 106 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing.
+All 120 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Two feature tests need more: one needs the pristine clone, and one needs the pristine clone, Docker and the `cosmic-sandbox` image. They are skipped otherwise.
 
 | Handout test | Where |
 |---|---|
@@ -310,6 +345,7 @@ All 106 tests run without a model, an account or an API key. The controller test
 | Action limit | `test_controller.py`: a repeating scripted reply stops after the limit, and no further action runs |
 | Output limit | `test_output.py`, `test_controller.py`, `test_sandbox.py`: large output is bounded and marked `[output shortened: ...]` |
 | Bug fix | `test_runner.py`: with a fake sandbox in place of Docker, the acceptance check fails on the starting code and passes after the change, and existing tests still pass. The real check is shown by `baseline` and `run` (see Results) |
+| Feature | `test_feature_task.py`: the reference patch changes exactly the task's editable files and applies to the starting commit; with Docker, the real acceptance check fails on the starting code for the expected reason, passes with the reference solution, and the regression checks pass both times |
 
 `test_acceptance_setup.py` checks that each task mounts only its own acceptance folder, that folder names which could point elsewhere are refused, and that the `integration_sqlite` check lists only tests that need no services.
 
@@ -327,11 +363,12 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                106 automated tests
+tests/                120 automated tests
 acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
-tasks/                task files
+tasks/                task files: invalid_quantity (Stage 1), batch_expiry (Stage 2)
+reference/            hand-written reference solutions, one patch per task, never shown to the agent
 config/target.toml    all settings
 sandbox/              Dockerfile and pinned dependencies for the sandbox image
-scripts/              fetch_target.sh, check_model.py, scripted_run.py
+scripts/              fetch_target.sh, check_model.py, scripted_run.py, check_reference.py
 workspace/            pristine clone and run folders (not committed)
 ```

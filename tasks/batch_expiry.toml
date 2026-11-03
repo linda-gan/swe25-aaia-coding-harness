@@ -1,0 +1,44 @@
+# The Stage 2 task: a feature across several modules of Cosmic Python.
+# The agent must find the modules itself; the description names behavior,
+# not files.
+description = """
+Add an optional expiry date to batches, for perishable stock.
+
+- The CreateBatch command gets a new optional field `expires` (a date),
+  after `eta`, with the default None. A batch without an expiry date never
+  expires.
+- A batch can be allocated up to and including its expiry date. From the
+  day after, it is expired: allocation must skip it and use another batch.
+  If no other batch can take the order line, the product is out of stock,
+  as it is today.
+- Creating a batch whose expiry date is earlier than its eta must be
+  rejected with a new exception InvalidExpiry, defined in
+  src/allocation/service_layer/handlers.py. A rejected batch must not be
+  added. An expiry date on the same day as the eta is allowed.
+- The expiry date must be stored in the database with the batch, so that
+  batches loaded through the SQLAlchemy repository keep it.
+- Existing code that creates batches or commands without an expiry date
+  must keep working unchanged.
+
+Do not modify tests.
+"""
+
+# Only these files may be edited. Paths are relative to the repository root.
+editable_files = [
+    "src/allocation/domain/commands.py",
+    "src/allocation/domain/model.py",
+    "src/allocation/service_layer/handlers.py",
+    "src/allocation/adapters/orm.py",
+]
+
+# This task's acceptance tests: the folder acceptance/batch_expiry.
+# Hidden from the agent; the harness runs them after the agent stops.
+acceptance_tests = "batch_expiry"
+
+# Checks the agent may run itself: the existing unit tests and the
+# integration tests on SQLite, which also cover the database mapping.
+agent_checks = ["unit_tests", "integration_sqlite"]
+
+# Checks the harness runs itself after the agent stops, whatever the model
+# says. The task passes only if all of them pass.
+final_checks = ["acceptance", "unit_tests", "integration_sqlite"]

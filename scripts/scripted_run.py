@@ -13,6 +13,7 @@ from pathlib import Path
 from harness.config import PROJECT_ROOT, load_config, load_task
 from harness.controller import AgentController
 from harness.model import ScriptedModelClient, tool_reply
+from harness.projects import select_project
 from harness.repo_tools import RepositoryTools
 from harness.sandbox import DockerSandbox
 
@@ -46,7 +47,8 @@ def main() -> int:
     repo = Path(sys.argv[1])
     config = load_config()
     task = load_task(PROJECT_ROOT / "tasks" / "invalid_quantity.toml")
-    sandbox = DockerSandbox(repo, config.sandbox, config.checks,
+    project = select_project(config, task)
+    sandbox = DockerSandbox(repo, project.sandbox, project.checks,
                             acceptance_dir=task.acceptance_dir)
     controller = AgentController(
         model=ScriptedModelClient(SCRIPT),

@@ -1,4 +1,11 @@
-"""Load harness settings from config/target.toml and tasks from tasks/*.toml."""
+"""Load harness settings from config/target.toml and tasks from tasks/*.toml.
+
+The config lists the allowed projects under [projects.<name>]. Each project
+brings everything that depends on the repository: where it comes from, the
+exact starting commit, where its pristine clone lives, its sandbox image and
+the only commands that may run for it. Limits, sandbox resources and the
+model are shared by all projects.
+"""
 import re
 import tomllib
 from dataclasses import dataclass
@@ -6,19 +13,15 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "target.toml"
+# Pristine clones and run folders live here, never anywhere else on the host.
+WORKSPACE_DIR = PROJECT_ROOT / "workspace"
 # Each task keeps its acceptance tests in its own folder under acceptance/.
 # The folder is outside every run copy, so the agent cannot change it.
 ACCEPTANCE_ROOT = PROJECT_ROOT / "acceptance"
-# A task names its folder with a plain name such as "invalid_quantity".
-# No slashes and no "..", so a task file cannot point anywhere else.
+# Plain names for projects and acceptance folders, such as "cosmicpython":
+# no slashes and no "..", so a name cannot point anywhere else.
 FOLDER_NAME = re.compile(r"[A-Za-z0-9_-]+")
-
-
-@dataclass(frozen=True)
-class TargetConfig:
-    url: str
-    commit: str
-    regression_tests: str
+COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
 @dataclass(frozen=True)
@@ -48,12 +51,30 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class ProjectConfig:
+    """One allowed project: a repository at an exact commit, and how to check it."""
+    name: str
+    url: str
+    commit: str  # the exact starting commit, 40 hex characters
+    pristine: Path  # absolute path of the clean clone, inside workspace/
+    sandbox: SandboxConfig  # this project's image plus the shared resources
+    checks: dict[str, list[str]]  # the only commands that may run, by name
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
-    target: TargetConfig
-    sandbox: SandboxConfig
+    projects: dict[str, ProjectConfig]  # the allowlist
     limits: LimitsConfig
     model: ModelConfig
-    checks: dict[str, list[str]]
+
+    def project(self, name: str) -> ProjectConfig:
+        """The allowed project with this name, or a clear refusal."""
+        if not isinstance(name, str) or name not in self.projects:
+            raise ValueError(
+                f"Project {str(name)[:60]!r} is not allowed. "
+                f"Allowed projects: {', '.join(self.projects)}."
+            )
+        return self.projects[name]
 
 
 @dataclass(frozen=True)
@@ -65,6 +86,9 @@ class Task:
     # This task's acceptance tests, mounted read-only at /acceptance in the
     # sandbox. None if the task has none.
     acceptance_dir: Path | None = None
+    # The project the task belongs to. Required in task files; whether it is
+    # allowed is decided against the config when a run starts.
+    project: str | None = None
 
 
 def _read(path: Path) -> dict:
@@ -72,29 +96,84 @@ def _read(path: Path) -> dict:
         return tomllib.load(f)
 
 
-def load_target_config(path: Path = DEFAULT_CONFIG) -> TargetConfig:
-    return TargetConfig(**_read(path)["target"])
-
-
-def load_config(path: Path = DEFAULT_CONFIG) -> HarnessConfig:
+def load_config(path: Path = DEFAULT_CONFIG, workspace_dir: Path = WORKSPACE_DIR) -> HarnessConfig:
     try:
-        return _build_config(_read(path))
+        return _build_config(_read(path), workspace_dir)
     except (KeyError, TypeError) as exc:
         raise ValueError(f"{path}: missing or unexpected setting ({exc}).") from None
 
 
-def _build_config(data: dict) -> HarnessConfig:
-    checks = data["checks"]
-    for name, argv in checks.items():
-        if not argv or not all(isinstance(part, str) for part in argv):
-            raise ValueError(f"Check {name!r} must be a non-empty list of strings.")
+def _build_config(data: dict, workspace_dir: Path) -> HarnessConfig:
+    resources = data["sandbox"]  # shared by every project
+    if "image" in resources:
+        raise ValueError("[sandbox] must not set an image; each project sets its own.")
+    projects_data = data["projects"]
+    if not isinstance(projects_data, dict) or not projects_data:
+        raise ValueError("The config must list at least one project under [projects.<name>].")
+
+    projects = {}
+    for name, values in projects_data.items():
+        projects[name] = _build_project(name, values, resources, workspace_dir)
+
+    clones = [p.pristine for p in projects.values()]
+    if len(set(clones)) != len(clones):
+        raise ValueError("Two projects use the same pristine folder.")
+
     return HarnessConfig(
-        target=TargetConfig(**data["target"]),
-        sandbox=SandboxConfig(**data["sandbox"]),
+        projects=projects,
         limits=LimitsConfig(**data["limits"]),
         model=ModelConfig(**data["model"]),
-        checks=checks,
     )
+
+
+def _build_project(name: str, values: dict, resources: dict, workspace_dir: Path) -> ProjectConfig:
+    where = f"[projects.{name}]"
+    if not FOLDER_NAME.fullmatch(name):
+        raise ValueError(f"{where}: a project name may only use letters, digits, '_' and '-'.")
+    unknown = set(values) - {"url", "commit", "pristine", "image", "checks"}
+    if unknown:
+        raise ValueError(f"{where}: unknown setting(s) {', '.join(sorted(unknown))}.")
+
+    url, commit, image = values["url"], values["commit"], values["image"]
+    for key, value in [("url", url), ("image", image)]:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{where}: {key} must be a non-empty string.")
+    if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+        raise ValueError(f"{where}: commit must be a full 40-character commit hash.")
+
+    checks = values["checks"]
+    if not isinstance(checks, dict) or not checks:
+        raise ValueError(f"{where}: at least one check is needed under [projects.{name}.checks].")
+    for check, argv in checks.items():
+        if not isinstance(argv, list) or not argv or not all(isinstance(p, str) for p in argv):
+            raise ValueError(f"{where}: check {check!r} must be a non-empty list of strings.")
+
+    return ProjectConfig(
+        name=name,
+        url=url,
+        commit=commit,
+        pristine=_pristine_dir(where, values["pristine"], workspace_dir),
+        sandbox=SandboxConfig(image=image, **resources),
+        checks=dict(checks),
+    )
+
+
+def _pristine_dir(where: str, value, workspace_dir: Path) -> Path:
+    """The pristine clone must lie inside workspace/, but not in the run folders.
+
+    "fetch" replaces this folder, so it must never be able to name a folder
+    elsewhere on the host.
+    """
+    workspace = workspace_dir.resolve()
+    if not isinstance(value, str) or not value.strip() or Path(value).is_absolute():
+        raise ValueError(f"{where}: pristine must be a relative path such as "
+                         "\"workspace/target-pristine\".")
+    folder = (workspace.parent / value).resolve()
+    if folder == workspace or not folder.is_relative_to(workspace):
+        raise ValueError(f"{where}: pristine must be a folder inside {workspace}.")
+    if folder.is_relative_to(workspace / "runs"):
+        raise ValueError(f"{where}: pristine must not be inside the run folders.")
+    return folder
 
 
 def load_task(path: Path | str, acceptance_root: Path = ACCEPTANCE_ROOT) -> Task:
@@ -106,9 +185,13 @@ def load_task(path: Path | str, acceptance_root: Path = ACCEPTANCE_ROOT) -> Task
             agent_checks=list(data["agent_checks"]),
             final_checks=list(data["final_checks"]),
             acceptance_dir=_acceptance_dir(path, data.get("acceptance_tests"), acceptance_root),
+            project=data["project"],
         )
     except (KeyError, TypeError, AttributeError) as exc:
         raise ValueError(f"{path}: missing or unexpected setting ({exc}).") from None
+    if not isinstance(task.project, str) or not FOLDER_NAME.fullmatch(task.project):
+        raise ValueError(f"{path}: project must be the plain name of a project, "
+                         f"such as \"cosmicpython\" (got {task.project!r}).")
     if not task.description:
         raise ValueError(f"Task {path} has an empty description.")
     if not task.final_checks:

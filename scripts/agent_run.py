@@ -17,6 +17,7 @@ from pathlib import Path
 from harness.config import PROJECT_ROOT, load_config, load_task
 from harness.controller import AgentController
 from harness.ollama_client import OllamaClient
+from harness.projects import select_project
 from harness.repo_tools import RepositoryTools
 from harness.sandbox import DockerSandbox
 
@@ -37,6 +38,7 @@ def main() -> int:
         model_config = dataclasses.replace(model_config, think=False)
 
     task = load_task(args.task)
+    project = select_project(config, task)
     start = time.monotonic()
 
     def show(event):
@@ -45,7 +47,7 @@ def main() -> int:
     controller = AgentController(
         model=OllamaClient(model_config),
         tools=RepositoryTools(args.repo),
-        sandbox=DockerSandbox(args.repo, config.sandbox, config.checks,
+        sandbox=DockerSandbox(args.repo, project.sandbox, project.checks,
                               acceptance_dir=task.acceptance_dir),
         task=task,
         limits=config.limits,

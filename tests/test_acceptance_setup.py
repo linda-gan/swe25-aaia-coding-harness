@@ -8,6 +8,8 @@ import pytest
 
 from harness.config import ACCEPTANCE_ROOT, PROJECT_ROOT, Task, load_config, load_task
 from harness.runner import check_task, make_sandbox
+
+PROJECT = load_config().project("cosmicpython")
 from harness.sandbox import DockerSandbox
 
 STAGE1_TASK = PROJECT_ROOT / "tasks" / "invalid_quantity.toml"
@@ -16,6 +18,7 @@ STAGE1_TASK = PROJECT_ROOT / "tasks" / "invalid_quantity.toml"
 def write_task(tmp_path, extra: str = "") -> str:
     path = tmp_path / "task.toml"
     path.write_text(
+        'project = "cosmicpython"\n'
         'description = "Do something."\n'
         'editable_files = ["src/a.py"]\n'
         'agent_checks = ["unit_tests"]\n'
@@ -91,12 +94,12 @@ def test_symlinked_folder_pointing_outside_is_refused(tmp_path, acceptance_root)
 def test_task_using_acceptance_check_without_folder_is_refused_early():
     task = Task("x", ["a.py"], ["unit_tests"], ["acceptance", "unit_tests"])
     with pytest.raises(ValueError, match="names no acceptance folder"):
-        check_task(task, load_config())
+        check_task(task, PROJECT)
 
 
 def test_task_without_acceptance_check_needs_no_folder():
     task = Task("x", ["a.py"], ["unit_tests"], ["unit_tests", "integration_sqlite"])
-    check_task(task, load_config())  # no error
+    check_task(task, PROJECT)  # no error
 
 
 def test_sandbox_gets_only_the_tasks_acceptance_folder(tmp_path):
@@ -109,15 +112,14 @@ def test_sandbox_gets_only_the_tasks_acceptance_folder(tmp_path):
     class Copy:  # the part of RunCopy that make_sandbox uses
         repo = tmp_path
 
-    make_sandbox(Copy(), load_config(), task, sandbox_factory=factory)
+    make_sandbox(Copy(), PROJECT, task, sandbox_factory=factory)
     assert received["acceptance_dir"] == task.acceptance_dir
     assert received["acceptance_dir"] != ACCEPTANCE_ROOT
 
 
 def test_docker_mounts_the_tasks_folder_read_only(tmp_path):
     task = load_task(STAGE1_TASK)
-    config = load_config()
-    sandbox = DockerSandbox(tmp_path, config.sandbox, config.checks,
+    sandbox = DockerSandbox(tmp_path, PROJECT.sandbox, PROJECT.checks,
                             acceptance_dir=task.acceptance_dir)
     command = " ".join(sandbox.build_create_command("c", ["true"]))
     assert f"src={task.acceptance_dir},dst=/acceptance,readonly" in command
@@ -126,7 +128,7 @@ def test_docker_mounts_the_tasks_folder_read_only(tmp_path):
 # ---- the SQLite integration check -----------------------------------------
 
 def test_sqlite_integration_check_runs_only_tests_that_need_no_services():
-    argv = load_config().checks["integration_sqlite"]
+    argv = PROJECT.checks["integration_sqlite"]
     files = [part for part in argv if part.startswith("tests/")]
     assert argv[0] == "pytest"
     assert files == [

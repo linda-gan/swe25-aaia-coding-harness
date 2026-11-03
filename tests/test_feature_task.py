@@ -19,12 +19,14 @@ from harness.config import ACCEPTANCE_ROOT, PROJECT_ROOT, load_config, load_task
 from harness.runner import check_task
 from harness.sandbox import CheckResult
 from harness.workspace import (
-    PRISTINE_DIR, WorkspaceError, apply_patch, changed_files, create_run_copy, git,
+    WorkspaceError, apply_patch, changed_files, create_project_copy, create_run_copy, git,
 )
 from scripts.check_reference import check_reference, default_patch
 
 TASK_PATH = PROJECT_ROOT / "tasks" / "batch_expiry.toml"
 PATCH = PROJECT_ROOT / "reference" / "batch_expiry.patch"
+PROJECT = load_config().project("cosmicpython")
+PRISTINE = PROJECT.pristine
 
 
 def patched_files(patch_text: str) -> set[str]:
@@ -35,7 +37,7 @@ def patched_files(patch_text: str) -> set[str]:
 
 def test_feature_task_loads_and_its_checks_exist():
     task = load_task(TASK_PATH)
-    check_task(task, load_config())  # no error
+    check_task(task, PROJECT)  # no error
     assert task.acceptance_dir == (ACCEPTANCE_ROOT / "batch_expiry").resolve()
     assert task.final_checks == ["acceptance", "unit_tests", "integration_sqlite"]
 
@@ -137,6 +139,7 @@ def small_task(tmp_path):
     """A task file for the small repository, using the batch_expiry acceptance folder name."""
     path = tmp_path / "small.toml"
     path.write_text(
+        'project = "cosmicpython"\n'
         'description = "Reject quantities of zero or less."\n'
         'editable_files = ["src/app/model.py"]\n'
         'acceptance_tests = "batch_expiry"\n'
@@ -168,14 +171,14 @@ def test_reference_check_flags_an_acceptance_check_that_passes_on_starting_code(
 # ---- with the real pristine clone (Git only) ------------------------------
 
 needs_pristine = pytest.mark.skipif(
-    not (PRISTINE_DIR / ".git").is_dir(),
+    not (PRISTINE / ".git").is_dir(),
     reason="needs the pristine clone (./scripts/fetch_target.sh)",
 )
 
 
 @needs_pristine
 def test_reference_patch_applies_to_the_starting_commit(tmp_path):
-    run_copy = create_run_copy(load_config().target.commit, runs_dir=tmp_path / "runs")
+    run_copy = create_project_copy(PROJECT, runs_dir=tmp_path / "runs")
     apply_patch(run_copy.repo, PATCH)
     changed = {path for _, path in changed_files(run_copy.repo)}
     assert changed == set(load_task(TASK_PATH).editable_files)
@@ -187,7 +190,7 @@ def _sandbox_image_available() -> bool:
     if shutil.which("docker") is None:
         return False
     try:
-        proc = subprocess.run(["docker", "image", "inspect", load_config().sandbox.image],
+        proc = subprocess.run(["docker", "image", "inspect", PROJECT.sandbox.image],
                               capture_output=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -195,7 +198,7 @@ def _sandbox_image_available() -> bool:
 
 
 needs_sandbox = pytest.mark.skipif(
-    not ((PRISTINE_DIR / ".git").is_dir() and _sandbox_image_available()),
+    not ((PRISTINE / ".git").is_dir() and _sandbox_image_available()),
     reason="needs the pristine clone, Docker and the cosmic-sandbox image",
 )
 
@@ -203,7 +206,7 @@ needs_sandbox = pytest.mark.skipif(
 @needs_sandbox
 def test_real_acceptance_fails_on_starting_code_and_passes_with_reference(tmp_path):
     config = load_config()
-    run_copy = create_run_copy(config.target.commit, runs_dir=tmp_path / "runs")
+    run_copy = create_project_copy(PROJECT, runs_dir=tmp_path / "runs")
     result = check_reference(TASK_PATH, PATCH, config, run_copy)
 
     before = {c.name: c for c in result.before.checks}

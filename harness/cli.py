@@ -1,7 +1,12 @@
-"""Command-line interface.
+"""Command-line interface. Parses arguments and prints; the work is done in
+the core modules (runner, projects, workspace).
 
+    python -m harness projects                             allowed projects and their tasks
+    python -m harness fetch cosmicpython                   make the project's pristine clone
     python -m harness run tasks/invalid_quantity.toml      agent run + verification
     python -m harness baseline tasks/invalid_quantity.toml checks on the starting code
+
+run and baseline take --project NAME; it must be allowed and match the task.
 
 Exit codes: 0 all checks passed, 1 checks failed, 2 setup problem,
 130 interrupted with Ctrl+C.
@@ -14,12 +19,13 @@ import os
 import sys
 from pathlib import Path
 
-from harness.config import load_config, load_task
+from harness.config import PROJECT_ROOT, HarnessConfig, load_config, load_task
 from harness.controller import Event, RunResult
 from harness.ollama_client import OllamaClient
+from harness.projects import TaskEntry, list_tasks, pristine_status, select_project
 from harness.runner import RunReport, check_task, make_sandbox, run_task
 from harness.verification import VerificationReport, verify
-from harness.workspace import WorkspaceError, create_run_copy
+from harness.workspace import WorkspaceError, create_project_copy, fetch_project
 
 EXIT_PASSED, EXIT_FAILED, EXIT_SETUP, EXIT_INTERRUPTED = 0, 1, 2, 130
 
@@ -143,24 +149,81 @@ def format_result(style: Style, report: RunReport) -> str:
     return "\n".join(lines)
 
 
+def shown_path(path: Path) -> str:
+    """A path relative to the harness folder when it lies inside it."""
+    path = Path(path).resolve()
+    return str(path.relative_to(PROJECT_ROOT)) if path.is_relative_to(PROJECT_ROOT) else str(path)
+
+
+def format_projects(style: Style, config: HarnessConfig, statuses: dict[str, str],
+                    tasks: list[TaskEntry]) -> str:
+    lines = [style.bold("Allowed projects (config/target.toml)")]
+    for name, project in config.projects.items():
+        status = statuses[name]
+        lines.append(heading(style, name))
+        lines.append(f"  Repository: {project.url}")
+        lines.append(f"  Commit:     {project.commit}")
+        lines.append(f"  Image:      {project.sandbox.image}")
+        lines.append(f"  Clone:      {shown_path(project.pristine)} "
+                     f"({style.green(status) if status == 'ready' else style.yellow(status)})")
+        lines.append(f"  Checks:     {', '.join(project.checks)}")
+        own = [t for t in tasks if t.task is not None and t.task.project == name]
+        lines.append("  Tasks:      " + (", ".join(shown_path(t.path) for t in own) or "(none)"))
+
+    other = [t for t in tasks if t.task is not None and t.task.project not in config.projects]
+    if other:
+        lines.append(heading(style, "Tasks for projects that are not allowed (cannot run)"))
+        lines.extend(f"  {shown_path(t.path)}  (project {t.task.project!r})" for t in other)
+    broken = [t for t in tasks if t.task is None]
+    if broken:
+        lines.append(heading(style, "Task files that could not be loaded"))
+        lines.extend(f"  {shown_path(t.path)}: {t.error}" for t in broken)
+    return "\n".join(lines)
+
+
 # ---- commands ----------------------------------------------------------------
 
-def cmd_run(args, style: Style) -> int:
+def prepare(args):
+    """Load the config and the task, and select the project: refuse early if anything is off."""
     config = load_config()
     task = load_task(args.task)
-    check_task(task, config)
+    project = select_project(config, task, args.project)
+    check_task(task, project)
+    return config, task, project
+
+
+def cmd_projects(args, style: Style) -> int:
+    config = load_config()
+    statuses = {name: pristine_status(project) for name, project in config.projects.items()}
+    print(format_projects(style, config, statuses, list_tasks()))
+    return EXIT_PASSED
+
+
+def cmd_fetch(args, style: Style) -> int:
+    project = load_config().project(args.project)  # only allowed projects can be fetched
+    print(f"Fetching {project.name}: {project.url} @ {project.commit[:12]}")
+    if fetch_project(project, force=args.force):
+        print(style.green(f"Pristine clone ready at {shown_path(project.pristine)}."))
+    else:
+        print(f"The pristine clone at {shown_path(project.pristine)} is already at the pinned "
+              "commit and unchanged; nothing to do (--force fetches it again).")
+    return EXIT_PASSED
+
+
+def cmd_run(args, style: Style) -> int:
+    config, task, project = prepare(args)
     model_config = config.model
     if args.model:
         model_config = dataclasses.replace(model_config, name=args.model)
     if args.no_think:
         model_config = dataclasses.replace(model_config, think=False)
 
-    run_copy = create_run_copy(config.target.commit)
+    run_copy = create_project_copy(project)
     print(style.bold("Coding harness"))
-    print(f"  Task:   {args.task}")
-    print(f"  Target: {config.target.url} @ {config.target.commit[:12]}")
-    print(f"  Copy:   {run_copy.repo}")
-    print(f"  Model:  {model_config.name} (thinking {'on' if model_config.think else 'off'})")
+    print(f"  Task:    {args.task}")
+    print(f"  Project: {project.name} ({project.url} @ {project.commit[:12]})")
+    print(f"  Copy:    {run_copy.repo}")
+    print(f"  Model:   {model_config.name} (thinking {'on' if model_config.think else 'off'})")
     print(heading(style, "Task"))
     print(task.description)
     print(heading(style, "Agent"))
@@ -169,6 +232,7 @@ def cmd_run(args, style: Style) -> int:
         task=task,
         task_path=args.task,
         config=config,
+        project=project,
         model=OllamaClient(model_config),
         model_name=model_config.name,
         run_copy=run_copy,
@@ -184,18 +248,16 @@ def cmd_run(args, style: Style) -> int:
 
 def cmd_baseline(args, style: Style) -> int:
     """Run the final checks on the unchanged code, to show the starting state."""
-    config = load_config()
-    task = load_task(args.task)
-    check_task(task, config)
-    run_copy = create_run_copy(config.target.commit)
+    config, task, project = prepare(args)
+    run_copy = create_project_copy(project)
     print(style.bold("Baseline: final checks on the unchanged starting code"))
-    print(f"  Target: {config.target.url} @ {config.target.commit[:12]}")
-    print(f"  Copy:   {run_copy.repo}")
-    report = verify(make_sandbox(run_copy, config, task), run_copy.repo, task)
+    print(f"  Project: {project.name} ({project.url} @ {project.commit[:12]})")
+    print(f"  Copy:    {run_copy.repo}")
+    report = verify(make_sandbox(run_copy, project, task), run_copy.repo, task)
     print(format_verification(style, report))
     print()
-    print("This is the starting state. For a bug-fix task the acceptance check "
-          "is expected to fail here.")
+    print("This is the starting state. For a new task, bug fix or feature, the "
+          "acceptance check is expected to fail here.")
     return EXIT_PASSED if report.passed else EXIT_FAILED
 
 
@@ -206,20 +268,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("projects", help="list the allowed projects, their clones and tasks")
+
+    fetch = sub.add_parser("fetch", help="make an allowed project's pristine clone")
+    fetch.add_argument("project", help="project name from config/target.toml, e.g. cosmicpython")
+    fetch.add_argument("--force", action="store_true", help="fetch again even if the clone is fine")
+
+    project_help = "project to work on; must be allowed and match the task (default: the task's)"
     run = sub.add_parser("run", help="run the agent on a task, then verify the result")
     run.add_argument("task", type=Path, help="task file, e.g. tasks/invalid_quantity.toml")
+    run.add_argument("--project", help=project_help)
     run.add_argument("--model", help="Ollama model name (default: from config)")
     run.add_argument("--no-think", action="store_true", help="turn thinking mode off")
 
     baseline = sub.add_parser("baseline", help="run the task's final checks on the starting code")
     baseline.add_argument("task", type=Path, help="task file, e.g. tasks/invalid_quantity.toml")
+    baseline.add_argument("--project", help=project_help)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     style = Style()
-    command = {"run": cmd_run, "baseline": cmd_baseline}[args.command]
+    command = {
+        "projects": cmd_projects, "fetch": cmd_fetch, "run": cmd_run, "baseline": cmd_baseline,
+    }[args.command]
     try:
         return command(args, style)
     except (WorkspaceError, ValueError, FileNotFoundError) as exc:

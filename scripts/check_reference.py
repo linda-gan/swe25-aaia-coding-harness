@@ -24,10 +24,11 @@ from pathlib import Path
 
 from harness.cli import Style, format_verification, heading
 from harness.config import PROJECT_ROOT, HarnessConfig, load_config, load_task
+from harness.projects import select_project
 from harness.runner import check_task, make_sandbox
 from harness.sandbox import DockerSandbox
 from harness.verification import VerificationReport, verify
-from harness.workspace import RunCopy, apply_patch, create_run_copy
+from harness.workspace import RunCopy, apply_patch, create_project_copy
 
 REFERENCE_DIR = PROJECT_ROOT / "reference"
 
@@ -55,8 +56,9 @@ def default_patch(task_path: Path) -> Path:
 def check_reference(task_path: Path, patch: Path, config: HarnessConfig,
                     run_copy: RunCopy, sandbox_factory=DockerSandbox) -> ReferenceResult:
     task = load_task(task_path)
-    check_task(task, config)
-    sandbox = make_sandbox(run_copy, config, task, sandbox_factory)
+    project = select_project(config, task)
+    check_task(task, project)
+    sandbox = make_sandbox(run_copy, project, task, sandbox_factory)
     before = verify(sandbox, run_copy.repo, task)
     apply_patch(run_copy.repo, patch)
     after = verify(sandbox, run_copy.repo, task)
@@ -72,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     style = Style()
     config = load_config()
     patch = args.patch or default_patch(args.task)
-    run_copy = create_run_copy(config.target.commit)
+    run_copy = create_project_copy(select_project(config, load_task(args.task)))
     print(style.bold("Reference check: are the acceptance checks sound?"))
     print(f"  Task:  {args.task}")
     print(f"  Patch: {patch}")

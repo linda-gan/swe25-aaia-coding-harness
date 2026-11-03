@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from harness.config import HarnessConfig, Task
+from harness.config import HarnessConfig, ProjectConfig, Task
 from harness.controller import AgentController, Event, RunResult
 from harness.repo_tools import RepositoryTools
 from harness.sandbox import DockerSandbox
@@ -42,15 +42,16 @@ class RunReport:
         return self.verification.passed
 
 
-def check_task(task: Task, config: HarnessConfig) -> None:
+def check_task(task: Task, project: ProjectConfig) -> None:
     """Fail early, with a clear message, if the task cannot run as written."""
     for name in [*task.agent_checks, *task.final_checks]:
-        if name not in config.checks:
+        if name not in project.checks:
             raise ValueError(
-                f"The task uses check {name!r}, which is not defined under [checks] "
-                f"in config/target.toml. Defined: {', '.join(config.checks)}."
+                f"The task uses check {name!r}, which is not defined under "
+                f"[projects.{project.name}.checks] in config/target.toml. "
+                f"Defined: {', '.join(project.checks)}."
             )
-        if task.acceptance_dir is None and uses_acceptance_mount(config.checks[name]):
+        if task.acceptance_dir is None and uses_acceptance_mount(project.checks[name]):
             raise ValueError(
                 f"The task uses check {name!r}, which runs acceptance tests, but the "
                 "task file names no acceptance folder. Add acceptance_tests = \"<folder>\"."
@@ -62,11 +63,12 @@ def uses_acceptance_mount(argv: list[str]) -> bool:
                for part in argv)
 
 
-def make_sandbox(run_copy: RunCopy, config: HarnessConfig, task: Task,
+def make_sandbox(run_copy: RunCopy, project: ProjectConfig, task: Task,
                  sandbox_factory=DockerSandbox):
-    """A sandbox for this run. Only this task's acceptance folder is mounted."""
+    """A sandbox for this run: the project's image and checks, and only this
+    task's acceptance folder."""
     return sandbox_factory(
-        run_copy.repo, config.sandbox, config.checks, acceptance_dir=task.acceptance_dir
+        run_copy.repo, project.sandbox, project.checks, acceptance_dir=task.acceptance_dir
     )
 
 
@@ -74,16 +76,17 @@ def run_task(
     task: Task,
     task_path: Path,
     config: HarnessConfig,
+    project: ProjectConfig,
     model,
     model_name: str,
     run_copy: RunCopy,
     on_event: Callable[[Event], None] | None = None,
     sandbox_factory=DockerSandbox,
 ) -> RunReport:
-    check_task(task, config)
+    check_task(task, project)
     started_at = datetime.now().isoformat(timespec="seconds")
     start = time.monotonic()
-    sandbox = make_sandbox(run_copy, config, task, sandbox_factory)
+    sandbox = make_sandbox(run_copy, project, task, sandbox_factory)
     controller = AgentController(
         model=model,
         tools=RepositoryTools(run_copy.repo),
@@ -104,17 +107,17 @@ def run_task(
         verification_seconds=round(end - verification_start, 1),
         total_seconds=round(end - start, 1),
     )
-    save_record(report, config)
+    save_record(report, project)
     return report
 
 
-def save_record(report: RunReport, config: HarnessConfig) -> Path:
+def save_record(report: RunReport, project: ProjectConfig) -> Path:
     """Write run.json and changes.diff next to the repository copy."""
     agent, verification = report.agent, report.verification
     record = {
         "run_id": report.run_copy.run_id,
         "task_file": str(report.task_path),
-        "target": {"url": config.target.url, "commit": config.target.commit},
+        "project": {"name": project.name, "url": project.url, "commit": project.commit},
         "model": report.model_name,
         "passed": report.passed,
         "timing": {

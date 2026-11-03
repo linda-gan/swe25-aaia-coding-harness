@@ -1,6 +1,10 @@
 # The Stage 2 task: a feature across several modules of Cosmic Python.
 # The agent must find the modules itself; the description names behavior,
 # not files.
+
+# The project this task belongs to; it must be listed in config/target.toml.
+project = "cosmicpython"
+
 description = """
 Add an optional expiry date to batches, for perishable stock.
 

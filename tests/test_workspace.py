@@ -50,7 +50,7 @@ def test_each_run_gets_its_own_folder(pristine, commit, tmp_path):
 
 
 def test_refuses_missing_pristine_copy(tmp_path):
-    with pytest.raises(WorkspaceError, match="fetch_target.sh"):
+    with pytest.raises(WorkspaceError, match="harness fetch"):
         create_run_copy("abc", pristine=tmp_path / "missing", runs_dir=tmp_path / "runs")
 
 

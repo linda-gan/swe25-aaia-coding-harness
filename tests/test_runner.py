@@ -76,6 +76,7 @@ def config():
 def run(run_copy, config, replies, sandbox_factory=FakeSandbox):
     return run_task(
         task=TASK, task_path="tasks/test.toml", config=config,
+        project=config.project("cosmicpython"),
         model=ScriptedModelClient(replies), model_name="scripted",
         run_copy=run_copy, sandbox_factory=sandbox_factory,
     )
@@ -136,7 +137,8 @@ def test_verification_runs_even_when_the_agent_hits_a_limit(run_copy, config):
         return sandbox_holder["s"]
 
     model = ScriptedModelClient([tool_reply("list_files")], repeat_last=True)
-    report = run_task(task=TASK, task_path="t", config=config, model=model, model_name="s",
+    report = run_task(task=TASK, task_path="t", config=config,
+                      project=config.project("cosmicpython"), model=model, model_name="s",
                       run_copy=run_copy, sandbox_factory=factory)
     assert report.agent.stop_reason == "action limit reached"
     assert sandbox_holder["s"].ran == ["acceptance", "unit_tests"]
@@ -180,7 +182,7 @@ def test_result_shows_timing(run_copy, config):
 def test_task_with_unknown_check_is_refused_early(config):
     bad = Task("x", ["a.py"], ["unit_tests"], ["integration"])
     with pytest.raises(ValueError, match="'integration'"):
-        check_task(bad, config)
+        check_task(bad, config.project("cosmicpython"))
 
 
 def test_check_names_longer_than_the_column_stay_aligned(run_copy):

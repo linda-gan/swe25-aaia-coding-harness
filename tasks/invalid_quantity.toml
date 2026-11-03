@@ -1,4 +1,8 @@
 # The Stage 1 task: what the agent is asked to do and what it may change.
+
+# The project this task belongs to; it must be listed in config/target.toml.
+project = "cosmicpython"
+
 description = """
 Allocating an order line with a quantity of zero or less must be rejected.
 The allocate handler should raise a new exception InvalidQuantity in

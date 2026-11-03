@@ -4,13 +4,15 @@ Usage, from the project root:
     python -m scripts.check_sandbox workspace/runs/test-run
     python -m scripts.check_sandbox workspace/runs/test-run --task tasks/invalid_quantity.toml
 
-The task file decides which acceptance folder is mounted at /acceptance.
+The task file decides the project (its image and checks) and which
+acceptance folder is mounted at /acceptance.
 """
 import argparse
 import sys
 from pathlib import Path
 
 from harness.config import PROJECT_ROOT, load_config, load_task
+from harness.projects import select_project
 from harness.sandbox import DockerSandbox
 
 
@@ -23,13 +25,14 @@ def main() -> int:
 
     config = load_config()
     task = load_task(args.task)
+    project = select_project(config, task)
     sandbox = DockerSandbox(
         args.repo,
-        config.sandbox,
-        config.checks,
+        project.sandbox,
+        project.checks,
         acceptance_dir=task.acceptance_dir,
     )
-    for name in config.checks:
+    for name in project.checks:
         result = sandbox.run_check(name)
         print(f"=== {name}: {result.status} "
               f"(exit code {result.exit_code}, {result.duration_seconds:.1f}s)")

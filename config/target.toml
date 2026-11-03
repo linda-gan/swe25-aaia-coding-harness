@@ -1,17 +1,15 @@
-[target]
+# ---- Allowed projects ------------------------------------------------------
+# The harness only works on projects listed here. A task file names its
+# project, and a run is refused unless that project is in this list.
+
+[projects.cosmicpython]
 url = "https://github.com/cosmicpython/code.git"
-commit = "14c84797ffa77255d53cf1a02fe6aafda2b68aeb"
-regression_tests = "tests/unit"
+commit = "14c84797ffa77255d53cf1a02fe6aafda2b68aeb"   # exact starting commit
+pristine = "workspace/target-pristine"   # clean clone: python -m harness fetch cosmicpython
+image = "cosmic-sandbox"                 # sandbox image with this project's dependencies
 
-[sandbox]
-image = "cosmic-sandbox"
-timeout_seconds = 120
-memory = "1g"
-cpus = "1"
-max_output_chars = 8000
-
-# The only commands that can run in the sandbox, by name.
-[checks]
+# The only commands that can run in this project's sandbox, by name.
+[projects.cosmicpython.checks]
 unit_tests = ["pytest", "tests/unit", "-q", "-p", "no:cacheprovider"]
 acceptance = ["pytest", "/acceptance", "-q", "-p", "no:cacheprovider"]
 # Integration tests that use an in-memory SQLite database: repository, unit of
@@ -26,6 +24,15 @@ integration_sqlite = [
     "-q", "-p", "no:cacheprovider",
     "-k", "not test_concurrent_updates_to_version_are_not_allowed",
 ]
+
+# ---- Shared by all projects -----------------------------------------------
+
+# Resources for every sandbox container (the image is set per project).
+[sandbox]
+timeout_seconds = 120
+memory = "1g"
+cpus = "1"
+max_output_chars = 8000
 
 [limits]
 max_actions = 30            # tool calls per run

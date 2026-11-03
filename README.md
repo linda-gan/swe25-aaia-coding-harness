@@ -102,7 +102,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-./scripts/fetch_target.sh                  # clean clone of Cosmic Python at the pinned commit
+python -m harness fetch cosmicpython      # clean clone of Cosmic Python at the pinned commit
 docker build -t cosmic-sandbox sandbox/    # sandbox image with Cosmic Python's dependencies
 docker pull python:3.12-slim               # used by the sandbox tests
 ollama pull qwen3.6:35b
@@ -111,7 +111,8 @@ ollama pull qwen3.6:35b
 Check the setup:
 
 ```bash
-pytest                          # 120 tests, no model needed
+python -m harness projects      # the allowed project, its clone (should say "ready") and tasks
+pytest                          # 155 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -119,8 +120,14 @@ python -m scripts.check_model   # Ollama answers and makes a tool call
 ## Usage
 
 ```bash
+python -m harness projects                               # allowed projects, clone status, tasks
+python -m harness fetch cosmicpython                     # make or repair a project's pristine clone
 python -m harness baseline tasks/invalid_quantity.toml   # final checks on the unchanged code
 python -m harness run tasks/invalid_quantity.toml        # agent run, then verification
+
+# The task file names its project. --project makes the choice explicit; it
+# must be an allowed project and match the task, or nothing runs:
+python -m harness run tasks/batch_expiry.toml --project cosmicpython
 
 # Options for one run, without editing config/target.toml:
 #   --model NAME   use another Ollama model
@@ -151,13 +158,15 @@ Exit codes: `0` all checks passed, `1` checks failed, `2` setup problem, `130` i
 
 | Section | Contents |
 |---|---|
-| `[target]` | repository URL, pinned commit, regression test path |
-| `[sandbox]` | image, 120 s time limit per check, 1 GB memory, 1 CPU, 8,000-character output limit |
-| `[checks]` | the only commands that can run in the sandbox, by name: `unit_tests`, `acceptance`, `integration_sqlite` |
+| `[projects.<name>]` | one entry per allowed project: repository URL, pinned commit, pristine clone folder, sandbox image |
+| `[projects.<name>.checks]` | the only commands that can run in that project's sandbox, by name: `unit_tests`, `acceptance`, `integration_sqlite` for `cosmicpython` |
+| `[sandbox]` | shared by all projects: 120 s time limit per check, 1 GB memory, 1 CPU, 8,000-character output limit |
 | `[limits]` | 30 actions, 10 refused actions, 3 replies in a row without a tool call, 6,000 characters of tool output per result |
 | `[model]` | Ollama host, model name, thinking on or off, 32,768-token context, 600 s per reply |
 
-A task file in `tasks/` sets the description, `editable_files`, `agent_checks`, `final_checks` and `acceptance_tests`.
+A task file in `tasks/` sets its `project`, the description, `editable_files`, `agent_checks`, `final_checks` and `acceptance_tests`.
+
+**Allowed projects.** The harness works only on projects listed under `[projects.<name>]`. A run is refused before anything starts if the task's project is not listed, or if `--project` names a different project. Each entry holds everything that depends on the repository, so a second project could have its own commit, image and checks. Its pristine clone must lie inside `workspace/` (not in `workspace/runs/`), because `fetch` replaces that folder, and two projects can't share one. `fetch` clones into a temporary folder, checks out the pinned commit, removes the Git remote, checks the result and only then replaces the old clone. A clone that is already correct is left alone. The run record stores the project's name, URL and commit.
 
 **Acceptance tests per task.** Each task keeps its acceptance tests in its own folder, `acceptance/<folder>/`, and names it with `acceptance_tests = "<folder>"`. Only that folder is mounted, read-only, at `/acceptance` in the sandbox, so one task never runs another task's acceptance tests. The name must be a plain folder name under `acceptance/` (no `/` or `..`, no symlink pointing elsewhere), because whatever it names is mounted into the container. A task that uses a check reading `/acceptance` but names no folder is refused before the run starts.
 
@@ -165,9 +174,11 @@ A task file in `tasks/` sets the description, `editable_files`, `agent_checks`, 
 
 ```mermaid
 flowchart TB
-    User(["User"]) -->|"task file"| CLI["CLI<br/>cli.py"]
+    User(["User"]) -->|"task file, --project"| CLI["CLI<br/>cli.py"]
+    CLI -->|"select_project()"| Projects["Projects<br/>projects.py"]
+    Projects -->|"allowlist"| Config[("config/target.toml")]
     CLI --> Runner["Runner<br/>runner.py"]
-    Runner -->|"create_run_copy()"| Workspace["Workspace<br/>workspace.py"]
+    CLI -->|"create_project_copy()"| Workspace["Workspace<br/>workspace.py"]
     Pristine[("workspace/target-pristine<br/>pinned commit")] -.->|"copied"| Copy[("workspace/runs/id/repo")]
     Workspace -.-> Copy
     Runner -->|"run()"| Controller["AgentController<br/>controller.py"]
@@ -190,8 +201,9 @@ How the modules map to the handout's parts:
 
 | Part | Module | Responsibility |
 |---|---|---|
-| Setup | `config.py`, `scripts/fetch_target.sh`, `sandbox/Dockerfile` | settings, pinned target clone, sandbox image |
-| Interface | `cli.py`, `__main__.py` | `run` and `baseline` commands; progress, checks, diff and result |
+| Setup | `config.py`, `workspace.py` (`fetch`), `sandbox/Dockerfile` | settings and allowed projects, pinned clone per project, sandbox image |
+| Projects | `projects.py`, `config.py` | allowlist; selecting the project for a run; clone status; tasks per project |
+| Interface | `cli.py`, `__main__.py` | `projects`, `fetch`, `run` and `baseline` commands; progress, checks, diff and result |
 | Controller | `controller.py`, `actions.py`, `prompts.py` | the agent loop; validation of every request; system prompt |
 | Model | `model.py`, `ollama_client.py` | model interface, scripted model for tests, Ollama client |
 | Repository tools | `repo_tools.py` | list, read, search and edit inside the run copy |
@@ -319,11 +331,12 @@ flowchart LR
 ```
 
 - **Disposable copy.** Each run works on a fresh copy of the pristine clone. Before copying, the harness checks that the pristine clone is at the pinned commit and has no local changes.
-- **Contained execution.** Repository code and tests run only inside Docker, one container per check, with the restrictions shown above. The model can't send shell commands: it can only name a check from `[checks]`.
+- **Contained execution.** Repository code and tests run only inside Docker, one container per check, with the restrictions shown above. The model can't send shell commands: it can only name a check from its project's `[projects.<name>.checks]`.
 - **Stoppable commands.** Each container is created first and then started with a time limit, so it always exists under a known name. When time runs out, `docker rm --force` removes it, which kills every process inside it, including background children. Pressing Ctrl+C during a check triggers the same cleanup.
 - **Checks in application code.** Every request is validated before it runs: the tool exists, the arguments are complete, correctly typed and not too long, edits go only to the task's editable files, and only the agent's checks can run. All file paths pass through one check that rejects absolute paths, `..` escapes and symlinks pointing outside the copy.
 - **Git cannot be turned against the host.** The file tools block `.git`, and inside the container `/work/.git` is read-only. Git on the host runs with fsmonitor, hooks and external diff and textconv helpers disabled.
 - **Untrusted input.** Model replies are parsed and validated, never executed directly. The system prompt tells the model to treat file contents and command output as data, not instructions.
+- **Only allowed projects.** A task can only run on a project from the allowlist in the config, and `--project` must match the task. Project names are plain names, and pristine clones must lie inside `workspace/`.
 - **No push, merge or deployment.** The pristine clone has no Git remote, the agent has no Git or network tool, and the container has no network.
 - **Credentials stay outside.** No credentials exist in the project or in any copy, and containers only see the run copy and the task's own acceptance folder.
 - **Visible results.** A scope check fails the run if any file outside `editable_files` changed, for example a file written by code run in a test.
@@ -334,7 +347,7 @@ flowchart LR
 pytest
 ```
 
-All 120 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Two feature tests need more: one needs the pristine clone, and one needs the pristine clone, Docker and the `cosmic-sandbox` image. They are skipped otherwise.
+All 155 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Two feature tests need more: one needs the pristine clone, and one needs the pristine clone, Docker and the `cosmic-sandbox` image. They are skipped otherwise.
 
 | Handout test | Where |
 |---|---|
@@ -347,13 +360,15 @@ All 120 tests run without a model, an account or an API key. The controller test
 | Bug fix | `test_runner.py`: with a fake sandbox in place of Docker, the acceptance check fails on the starting code and passes after the change, and existing tests still pass. The real check is shown by `baseline` and `run` (see Results) |
 | Feature | `test_feature_task.py`: the reference patch changes exactly the task's editable files and applies to the starting commit; with Docker, the real acceptance check fails on the starting code for the expected reason, passes with the reference solution, and the regression checks pass both times |
 
+`test_projects.py` covers the allowlist: unknown or mismatched projects are refused before anything runs, pristine folders outside `workspace/` are refused, each project gets its own image and checks, and `fetch` (from a local repository) creates, keeps, repairs and cleans up clones.
+
 `test_acceptance_setup.py` checks that each task mounts only its own acceptance folder, that folder names which could point elsewhere are refused, and that the `integration_sqlite` check lists only tests that need no services.
 
 Further tests cover stuck commands (stopped together with their child processes), no network in the sandbox, read-only `.git` and acceptance mounts, run copies, the scope check, the Ollama client's error handling and context limit, and the run record.
 
 ## Limitations and observations
 
-- One task and one target repository so far. Navigation, context management and sessions are planned for Stage 2.
+- One allowed project so far. The config and the commands support several, and the tests use a second, made-up project. Navigation, context management and sessions are still to come in Stage 2.
 - Context is protected only by a hard limit. A conversation that would exceed the model's context window stops the run instead of being summarized.
 - The `search` tool matches plain text. The model sometimes searched with regular expressions such as `qty.*0`, even though the tool description says plain text: once in a run with thinking on, three times in the run with thinking off. Those searches found nothing, but cost actions.
 - By design, the agent can't run the acceptance check: it sees only the task description and the unit tests.
@@ -363,12 +378,12 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                120 automated tests
+tests/                155 automated tests
 acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
 tasks/                task files: invalid_quantity (Stage 1), batch_expiry (Stage 2)
 reference/            hand-written reference solutions, one patch per task, never shown to the agent
 config/target.toml    all settings
 sandbox/              Dockerfile and pinned dependencies for the sandbox image
-scripts/              fetch_target.sh, check_model.py, scripted_run.py, check_reference.py
+scripts/              check_model.py, scripted_run.py, check_reference.py; fetch_target.sh (same as python -m harness fetch cosmicpython)
 workspace/            pristine clone and run folders (not committed)
 ```

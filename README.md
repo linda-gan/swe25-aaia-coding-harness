@@ -24,14 +24,17 @@ In each run the acceptance check went from 2 failed, 1 passed to 3 passed, all 2
 
 With thinking off, each model reply is faster, but the agent took more steps: it repeated searches and tried regular expressions that plain-text search cannot match. Total time was about the same, but the run used 21 of its 30 allowed actions, against 14 to 15 with thinking on. Thinking stays on by default.
 
-**Stage 2, first real runs** (after the context step, before the edit-test-fix loop), with thinking on and no manual help:
+**Stage 2 real runs**, with thinking on and no manual help:
 
-| Run | Task | Actions | Agent time | Stop reason | Result |
-|---|---|---|---|---|---|
-| `20261103-164853-9f8863` | `invalid_quantity` | 12 | 109.8 s | finished | PASSED |
-| `20261103-165247-037874` | `batch_expiry` | 30 of 30 | 217.5 s | action limit reached | PASSED |
+| Run | Harness state | Task | Actions | Agent time | Stop reason | Result |
+|---|---|---|---|---|---|---|
+| `20261103-164853-9f8863` | after context step | `invalid_quantity` | 12 of 30 | 109.8 s | finished | PASSED |
+| `20261103-165247-037874` | after context step | `batch_expiry` | 30 of 30 | 217.5 s | action limit reached | PASSED |
+| `20261103-172351-de62cc` | with edit-test-fix loop | `batch_expiry` | 19 of 40 | 193.2 s | finished (0 fix rounds) | PASSED |
 
 The feature run changed all four modules, including the database mapping, and every final check passed (acceptance 9 of 9). The model's design differs from the reference solution: it passes `today` into the domain model instead of reading the clock there. But the run hit the action limit just before calling `finish`. About 10 of its 30 actions were repeats: it read the four files twice at the start, and at the end it read them all again and re-ran both checks "to verify". The next step answered this. The harness now runs the checks itself at `finish`, and the prompt says that re-checking only to confirm isn't needed. The feature task also got its own limit of 40 actions.
+
+With the edit-test-fix loop, the feature run took 19 actions, with no repeated reads at the start. It reviewed its work with one `git_diff` instead of re-reading four files, and the harness's checks at `finish` passed at the first attempt. The model also caught a mistake of its own: it had written `handlers.InvalidExpiry` inside `handlers.py`, re-read the file and fixed it before running any check.
 
 ## Target and task
 
@@ -121,7 +124,7 @@ Check the setup:
 
 ```bash
 python -m harness projects      # the allowed project, its clone (should say "ready") and tasks
-pytest                          # 226 tests, no model needed
+pytest                          # 242 tests, no model needed
 python -m scripts.check_model   # Ollama answers and makes a tool call
 ```
 
@@ -144,6 +147,12 @@ python -m harness run tasks/batch_expiry.toml --project cosmicpython
 python -m harness run tasks/invalid_quantity.toml --no-think
 ```
 
+```bash
+python -m harness sessions                  # all sessions: status, steps, actions used, task
+python -m harness show 172351-de62cc        # one session; a unique start or end of the ID is enough
+python -m harness show de62cc --history     # also the saved conversation
+```
+
 `python -m scripts.scripted_feature_run` shows the edit-test-fix loop on the feature task without a model (it needs Docker): a scripted "model" forgets the database mapping, the harness's checks at `finish` fail, the script fixes it in fix round 1, and the second `finish` passes.
 
 `run` prints the task, live progress for every step (thinking, action, result, refusals), the agent's stop reason, the harness's own verification, the changed files, the colored diff, a PASSED or FAILED result, and the timing.
@@ -155,6 +164,9 @@ workspace/runs/<date-time-id>/
   repo/          the copy the agent worked on
   task.json      the task record: request, starting commit, allowed changes, checks,
                  limits and every step, written at the start and after each step
+  session.json   the checkpoint: status, used limits, pending action, context state,
+                 conversation, checks, errors, working-copy fingerprint
+  session.lock   held by the running process; free once it has ended
   run.json       task, model, timing, every event and message, check results, diff
   changes.diff   the resulting diff
 ```
@@ -196,6 +208,8 @@ flowchart TB
     Pristine[("workspace/target-pristine<br/>pinned commit")] -.->|"copied"| Copy[("workspace/runs/id/repo")]
     Workspace -.-> Copy
     Runner -->|"run()"| Controller["AgentController<br/>controller.py"]
+    Controller -->|"on_pending, on_checkpoint"| Session["Session<br/>session.py"]
+    Session -->|"session.json, lock"| SessionFiles[("workspace/runs/id/")]
     Controller -->|"initial_messages(), view()"| Context["ContextManager<br/>context.py"]
     Context -->|"repository map, outlines"| Navigator
     Controller <-->|"next_reply(view)"| Client["OllamaClient<br/>ollama_client.py"]
@@ -227,6 +241,8 @@ How the modules map to the handout's parts:
 | Repository tools | `repo_tools.py` | list, read, search and edit inside the run copy |
 | Navigation | `navigation.py` | symbols, file outlines and module dependencies (parsed with `ast`, never run); read-only Git status and diff |
 | Context | `context.py`, `prompts.py` | repository map and file selection; trusted and untrusted text kept apart; history within the size limit |
+| Task execution | `task_record.py`, `controller.py` | task record and step log; edit-test-fix loop at `finish`; per-task action limits |
+| Sessions | `session.py`, `cli.py` | checkpoint after every step; pending action; running or interrupted from the lock; `sessions` and `show` |
 | Execution | `sandbox.py` | configured checks in a locked-down container; output and exit codes |
 | Limits | `controller.py`, `output.py`, `ollama_client.py` | action, refusal and retry limits; output limits; context limit |
 | Verification | `verification.py`, `workspace.py`, `runner.py` | final checks, scope check, diff, run record |
@@ -266,6 +282,18 @@ classDiagram
         +edit_file(path, old, new) str
         +resolve(path) Path
         +files(path)
+    }
+    class Session {
+        +create(run_copy, task_path, project, model)
+        +pending(info)
+        +checkpoint(run, context_state)
+        +finish(verification)
+        +status str
+        +uncertain_action dict
+    }
+    class SessionStore {
+        +all() list
+        +open(ref) Session
     }
     class TaskRecord {
         +create(run_copy, task, project, limits)
@@ -317,6 +345,8 @@ classDiagram
     AgentController --> DockerSandbox : agent checks
     AgentController ..> RunResult : returns
     AgentController ..> TaskRecord : on_step, wired by the runner
+    AgentController ..> Session : on_pending, on_checkpoint
+    SessionStore --> Session : finds and loads
     DockerSandbox ..> CheckResult : returns
     VerificationReport --> CheckResult : final checks
 ```
@@ -440,6 +470,45 @@ Whatever the reason, verification then runs the final checks, including the hidd
 
 **Action limits per task.** The config's `max_actions = 30` is the default. A task file may set its own `max_actions`, up to `max_actions_ceiling = 60`. A higher value is refused before anything runs. `batch_expiry` sets 40, because the first real run needed more than 30 actions. The Stage 1 task keeps 30.
 
+## Sessions
+
+Every `run` is a session, saved in its run folder. The session ID is the run ID, and a unique start or end of it is enough on the command line. (`baseline` runs no agent and makes no session.)
+
+```mermaid
+stateDiagram-v2
+    [*] --> running: run starts, lock taken
+    running --> running: checkpoint after every step
+    running --> verifying: agent loop stopped
+    verifying --> passed: all final checks pass
+    verifying --> failed: a final check fails or cannot run
+    running --> interrupted: process gone (Ctrl+C, crash, kill)
+    verifying --> interrupted: process gone
+    passed --> [*]
+    failed --> [*]
+```
+
+**What is saved.** `session.json` is the checkpoint. It is written after every completed step and when the run stops, in the same safe way as the task record (temporary file, then `os.replace`). It holds:
+- the status;
+- the used limits (actions, refused actions, retries, fix rounds, steps);
+- the context state (marker code, shortened results);
+- the full conversation, the events, every check run during the loop (by the model or at `finish`, with the end of its output), and the errors (refused requests, tool errors, model errors);
+- a fingerprint of the working copy: the starting commit plus a SHA-256 hash of every changed file, which includes the harness's own edits;
+- after the run, the final verification.
+
+Together with `task.json` (task details and steps), this is everything `show` displays. It all comes from files, so it works the same after the application has been restarted.
+
+**Pending action.** Just before an action or the finish checks start, the session saves "step N started: tool, target". The next checkpoint clears it. If the process ends in between, the pending action stays in the file.
+
+**Running or interrupted?** While a run is active, its process holds an exclusive lock (`flock`) on `session.lock`. The operating system releases the lock when the process ends in any way: normally, by Ctrl+C, by a crash or by `kill -9`. So a session saved as running or verifying whose lock is free belongs to a process that is gone. It is shown as **interrupted**, and a pending action is shown as **uncertain**, because nobody knows whether it completed. This works without trusting process IDs, which the system can reuse. "Interrupted" is never written to the file. It is worked out each time a session is read, so a session that is running right now is never mislabelled.
+
+**Showing progress.** `sessions` lists every session with its status, steps, actions used of the limit, fix rounds, last update and task, plus any uncertain action. `show` gives one session in detail:
+- task, project and starting commit, model, used limits and stop reason;
+- the request and the allowed changes;
+- progress as steps per phase, and the numbered steps;
+- the checks during the run, the errors and the changed files with their hashes;
+- the final verification;
+- with `--history`, the saved conversation.
+
 ## Protecting the working environment
 
 ```mermaid
@@ -482,7 +551,7 @@ flowchart LR
 pytest
 ```
 
-All 226 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Six tests need more. Four need the pristine clone: the reference patch applies, navigation finds what the feature needs, file selection picks the editable files of both tasks, and the scripted feature run's edits fit the real code. Two need the pristine clone, Docker and the `cosmic-sandbox` image: the real reference check, and the real scripted feature run. They are skipped otherwise.
+All 242 tests run without a model, an account or an API key. The controller tests use a scripted model, and the client tests use a small local fake Ollama server. The 7 sandbox tests that start real containers are skipped when Docker or the `python:3.12-slim` image is missing. Six tests need more. Four need the pristine clone: the reference patch applies, navigation finds what the feature needs, file selection picks the editable files of both tasks, and the scripted feature run's edits fit the real code. Two need the pristine clone, Docker and the `cosmic-sandbox` image: the real reference check, and the real scripted feature run. They are skipped otherwise.
 
 | Handout test | Where |
 |---|---|
@@ -495,6 +564,7 @@ All 226 tests run without a model, an account or an API key. The controller test
 | Action limit | `test_controller.py`: a repeating scripted reply stops after the limit, and no further action runs |
 | Output limit | `test_output.py`, `test_controller.py`, `test_sandbox.py`: large output is bounded and marked `[output shortened: ...]` |
 | Task execution | `test_task_execution.py`: the task record holds request, starting commit, allowed changes, checks and limits; steps are on disk before the next model request; the record can be reopened after the run |
+| Session storage | `test_sessions.py`: a full run (refused request, failing check, fix, passing finish) is reopened with task details, steps, history, errors, check results, used limits and fingerprint; a separate Python process shows it with `show --history`; a harness process killed with `SIGKILL` during a check leaves an interrupted session with that check marked uncertain and the harness's own edit in the fingerprint; Ctrl+C does the same; a session in use shows as running and cannot be opened twice; IDs are found by unique parts, unsafe or ambiguous ones are refused |
 | Checks and loop | `test_task_execution.py`: scripted replies call `finish` too early, get the failing check output and a fix-round note, fix the code and finish; checks that never pass stop after the last fix round; unavailable checks stop at once and the run is never PASSED; `test_feature_task.py`: the scripted feature run needs exactly one fix round on the real code |
 | Bug fix | `test_runner.py`: with a fake sandbox in place of Docker, the acceptance check fails on the starting code and passes after the change, and existing tests still pass. The real check is shown by `baseline` and `run` (see Results) |
 | Feature | `test_feature_task.py`: the reference patch changes exactly the task's editable files and applies to the starting commit; with Docker, the real acceptance check fails on the starting code for the expected reason, passes with the reference solution, and the regression checks pass both times |
@@ -508,6 +578,7 @@ Further tests cover stuck commands (stopped together with their child processes)
 ## Limitations and observations
 
 - One allowed project so far. The config and the commands support several, and the tests use a second, made-up project. Navigation, context management and sessions are still to come in Stage 2.
+- Sessions rely on `flock`, so they need Linux or WSL (as the whole harness does), and a session is seen as running only on the computer that runs it.
 - The history summary is mechanical: it lists what shortened steps did, not what the model learned from them. A result that was shortened has to be fetched again if it is needed. Token counts are estimated (3 characters per token), not counted by the model's tokenizer.
 - File selection uses names and words, not meaning: a task that describes behavior in words that appear in no file name or symbol gets fewer useful selections. Editable files always rank high.
 - The `search` tool matches plain text. In Stage 1 the model sometimes searched with regular expressions such as `qty.*0`, even though the tool description says plain text: once in a run with thinking on, three times in the run with thinking off. Those searches found nothing, but cost actions. Regex search is still left out on purpose (see Navigation tools); instead, an empty result now explains this, and `find_symbol` covers the most common reason to search.
@@ -519,7 +590,7 @@ Further tests cover stuck commands (stopped together with their child processes)
 
 ```
 harness/              the harness (see Architecture)
-tests/                226 automated tests
+tests/                242 automated tests
 acceptance/<task>/    acceptance tests, one folder per task, outside the agent's writable area
 tasks/                task files: invalid_quantity (Stage 1), batch_expiry (Stage 2)
 reference/            hand-written reference solutions, one patch per task, never shown to the agent

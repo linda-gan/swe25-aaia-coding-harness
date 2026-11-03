@@ -16,6 +16,7 @@ from harness.config import HarnessConfig, LimitsConfig, ProjectConfig, Task
 from harness.controller import AgentController, Event, RunResult
 from harness.repo_tools import RepositoryTools
 from harness.sandbox import DockerSandbox
+from harness.session import Session
 from harness.task_record import TaskRecord
 from harness.verification import VerificationReport, verify
 from harness.workspace import RunCopy
@@ -95,42 +96,56 @@ def run_task(
     run_copy: RunCopy,
     on_event: Callable[[Event], None] | None = None,
     sandbox_factory=DockerSandbox,
+    on_session: Callable[[Session], None] | None = None,
 ) -> RunReport:
     check_task(task, project)
     limits = effective_limits(task, config.limits)
-    # Saved before the agent starts, and updated after every step.
-    record = TaskRecord.create(run_copy, task, task_path, project, limits)
-    started_at = datetime.now().isoformat(timespec="seconds")
-    start = time.monotonic()
-    sandbox = make_sandbox(run_copy, project, task, sandbox_factory)
-    controller = AgentController(
-        model=model,
-        tools=RepositoryTools(run_copy.repo),
-        sandbox=sandbox,
-        task=task,
-        limits=limits,
-        on_event=on_event,
-        context=config.context,
-        on_step=record.add_step,
-    )
-    agent = controller.run()
-    # Verification always runs, whatever the reason the agent stopped.
-    verification_start = time.monotonic()
-    verification = verify(sandbox, run_copy.repo, task)
-    end = time.monotonic()
-    report = RunReport(
-        task_path, run_copy, model_name, agent, verification,
-        started_at=started_at,
-        finished_at=datetime.now().isoformat(timespec="seconds"),
-        verification_seconds=round(end - verification_start, 1),
-        total_seconds=round(end - start, 1),
-    )
-    save_record(report, project)
-    record.finish(agent.stop_reason, agent.fix_rounds, report.passed,
-                  [{"name": c.name, "status": c.status} for c in verification.checks]
-                  + [{"name": "scope", "status": "passed" if verification.scope.passed
-                      else "failed"}])
-    return report
+    # The session takes its lock first, so it shows as running from the start.
+    session = Session.create(run_copy, task_path, project, model_name)
+    try:
+        if on_session:
+            on_session(session)
+        # Saved before the agent starts, and updated after every step.
+        record = TaskRecord.create(run_copy, task, task_path, project, limits)
+        started_at = datetime.now().isoformat(timespec="seconds")
+        start = time.monotonic()
+        sandbox = make_sandbox(run_copy, project, task, sandbox_factory)
+        controller = AgentController(
+            model=model,
+            tools=RepositoryTools(run_copy.repo),
+            sandbox=sandbox,
+            task=task,
+            limits=limits,
+            on_event=on_event,
+            context=config.context,
+            on_step=record.add_step,
+            on_pending=session.pending,
+            on_checkpoint=session.checkpoint,
+        )
+        agent = controller.run()
+        # Verification always runs, whatever the reason the agent stopped.
+        session.verifying()
+        verification_start = time.monotonic()
+        verification = verify(sandbox, run_copy.repo, task)
+        end = time.monotonic()
+        report = RunReport(
+            task_path, run_copy, model_name, agent, verification,
+            started_at=started_at,
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            verification_seconds=round(end - verification_start, 1),
+            total_seconds=round(end - start, 1),
+        )
+        save_record(report, project)
+        record.finish(agent.stop_reason, agent.fix_rounds, report.passed,
+                      [{"name": c.name, "status": c.status} for c in verification.checks]
+                      + [{"name": "scope", "status": "passed" if verification.scope.passed
+                          else "failed"}])
+        session.finish(verification)
+        return report
+    finally:
+        # Also after Ctrl+C or an error: the lock is released, so the session
+        # then shows as interrupted, with any pending action marked uncertain.
+        session.close()
 
 
 def save_record(report: RunReport, project: ProjectConfig) -> Path:

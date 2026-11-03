@@ -5,6 +5,8 @@ the core modules (runner, projects, workspace).
     python -m harness fetch cosmicpython                   make the project's pristine clone
     python -m harness run tasks/invalid_quantity.toml      agent run + verification
     python -m harness baseline tasks/invalid_quantity.toml checks on the starting code
+    python -m harness sessions                             saved sessions and their status
+    python -m harness show <session id>                    one session in detail
 
 run and baseline take --project NAME; it must be allowed and match the task.
 
@@ -24,8 +26,9 @@ from harness.controller import Event, RunResult
 from harness.ollama_client import OllamaClient
 from harness.projects import TaskEntry, list_tasks, pristine_status, select_project
 from harness.runner import RunReport, check_task, effective_limits, make_sandbox, run_task
+from harness.session import INTERRUPTED, Session, SessionError, SessionStore
 from harness.verification import VerificationReport, verify
-from harness.workspace import WorkspaceError, create_project_copy, fetch_project
+from harness.workspace import RUNS_DIR, WorkspaceError, create_project_copy, fetch_project
 
 EXIT_PASSED, EXIT_FAILED, EXIT_SETUP, EXIT_INTERRUPTED = 0, 1, 2, 130
 
@@ -183,6 +186,140 @@ def format_projects(style: Style, config: HarnessConfig, statuses: dict[str, str
     return "\n".join(lines)
 
 
+STATUS_COLORS = {"passed": "green", "failed": "red", INTERRUPTED: "yellow",
+                 "running": "cyan", "verifying": "cyan"}
+
+
+def color_status(style: Style, status: str) -> str:
+    return getattr(style, STATUS_COLORS.get(status, "bold"))(status)
+
+
+def format_sessions(style: Style, sessions: list[Session]) -> str:
+    if not sessions:
+        return "No sessions yet. Start one with: python -m harness run <task file>"
+    lines = [style.bold(f"{'Session':<24} {'Status':<12} {'Steps':>5} {'Actions':>8} "
+                        f"{'Fix':>4}  {'Updated':<19}  Task")]
+    for session in sessions:
+        data, record = session.data, session.task_record()
+        limit = record.data["limits"]["max_actions"] if record else "?"
+        counters = data["counters"]
+        status = session.status
+        lines.append(
+            f"{session.session_id:<24} {color_status(style, status):<12} "
+            f"{counters['steps']:>5} {str(counters['actions']) + '/' + str(limit):>8} "
+            f"{counters['fix_rounds']:>4}  {data['updated_at']:<19}  {shown_path(data['task_file'])}"
+        )
+        if session.uncertain_action:
+            lines.append(style.yellow(f"{'':<24} uncertain: {describe_pending(session.uncertain_action)}"))
+    return "\n".join(lines)
+
+
+def describe_pending(pending: dict) -> str:
+    target = f" {pending['target']}" if pending.get("target") else ""
+    return f"step {pending['step']} ({pending['tool']}{target}), started {pending['started_at']}"
+
+
+def format_session(style: Style, session: Session, history: bool = False) -> str:
+    data, record = session.data, session.task_record()
+    counters, status = data["counters"], session.status
+    task = record.data if record else {}
+    limits = task.get("limits", {})
+    lines = [style.bold(f"Session {session.session_id}")]
+    lines.append(f"  Status:   {color_status(style, status)}")
+    if session.uncertain_action:
+        lines.append(style.yellow(
+            f"  Uncertain action: {describe_pending(session.uncertain_action)}. The run stopped "
+            "while it was in progress, so it is not known whether it completed."))
+    lines.append(f"  Task:     {shown_path(data['task_file'])}")
+    if task:
+        lines.append(f"  Project:  {task['project']['name']} at starting commit "
+                     f"{task['starting_commit'][:12]}")
+    lines.append(f"  Model:    {data['model']}")
+    lines.append(f"  Copy:     {data['repo']}")
+    lines.append(f"  Updated:  {data['updated_at']} (created {data['created_at']})")
+    lines.append(f"  Used:     {counters['actions']} of {limits.get('max_actions', '?')} actions, "
+                 f"{counters['denied']} refused, {counters['retries']} retries, "
+                 f"{counters['fix_rounds']} of {limits.get('max_fix_rounds', '?')} fix rounds")
+    stopped = data["stop_reason"] or "(not stopped)"
+    if data.get("stop_detail") and data["stop_reason"] != "finished":
+        stopped += f": {data['stop_detail']}"
+    lines.append(f"  Stopped:  {stopped}")
+
+    if task:
+        lines.append(heading(style, "Request"))
+        lines.extend("  " + line for line in task["request"].splitlines())
+        lines.append(heading(style, "Allowed changes"))
+        lines.extend(f"  {path}" for path in task["allowed_changes"])
+
+    progress = session.progress()
+    lines.append(heading(style, "Progress (steps per phase)"))
+    lines.append("  " + (", ".join(f"{phase} {n}" for phase, n in progress.items()) or "(no steps yet)"))
+
+    lines.append(heading(style, "Steps"))
+    for step in (record.steps if record else []):
+        target = f" {step['target']}" if step.get("target") else ""
+        outcome = step.get("status") or ("ok" if step["ok"] else "error")
+        line = f"  {step['step']:>3}  {step['phase']:<14} {step['tool']}{target}  [{outcome}]"
+        lines.append(line if step["ok"] else style.red(line))
+    if data.get("pending_action"):
+        pending = data["pending_action"]
+        label = "UNCERTAIN" if status == INTERRUPTED else "running now"
+        lines.append(style.yellow(f"  {pending['step']:>3}  {label:<14} {pending['tool']}"
+                                  f"{' ' + pending['target'] if pending.get('target') else ''}"))
+
+    lines.append(heading(style, "Checks during the run"))
+    if data["checks"]:
+        for check in data["checks"]:
+            lines.append(f"  step {check['step']:>3}  by {check['by']:<6} {check['name']:<20} "
+                         f"{style.status(check['status'])}")
+    else:
+        lines.append("  (none)")
+
+    lines.append(heading(style, "Errors"))
+    if data["errors"]:
+        for error in data["errors"]:
+            where = f"step {error['step']}" if error["step"] else "run"
+            first = error["message"].splitlines()[0]
+            lines.append(style.red(f"  {where}: {first}"))
+    else:
+        lines.append("  (none)")
+
+    lines.append(heading(style, "Working copy (changed files)"))
+    files = data["working_copy"]["files"]
+    if files:
+        lines.extend(f"  {path}  {(digest or 'deleted')[:12]}" for path, digest in files.items())
+    else:
+        lines.append("  (no changes)")
+
+    lines.append(heading(style, "Final verification"))
+    verification = data.get("verification")
+    if verification:
+        width = max([12, *(len(c["name"]) for c in verification["checks"])])
+        for check in verification["checks"]:
+            detail = check["error"] or last_line(check["output_tail"]) or ""
+            lines.append(f"  {check['name']:<{width}} {style.status(check['status']):<8}  {detail}")
+        scope = verification["scope"]
+        lines.append(f"  {'scope':<{width}} {style.status('passed' if scope['passed'] else 'failed'):<8}"
+                     + ("" if scope["passed"] else f"  changed outside the task: {', '.join(scope['outside'])}"))
+        lines.append(style.bold(style.green("  RESULT: PASSED") if verification["passed"]
+                                else style.red("  RESULT: FAILED")))
+    else:
+        lines.append("  not run" + (" (the session was interrupted)" if status == INTERRUPTED else " yet"))
+
+    lines.append(heading(style, "History"))
+    messages = data["messages"]
+    lines.append(f"  {len(messages)} messages saved"
+                 + ("" if history else "; show them with --history"))
+    if history:
+        for i, message in enumerate(messages):
+            who = message["role"] + (f" {message['tool_name']}" if message.get("tool_name") else "")
+            text = " ".join(str(message.get("content", "")).split())
+            if message.get("tool_calls"):
+                text += " -> " + ", ".join(c["function"]["name"] for c in message["tool_calls"])
+            lines.append(f"  {i:>3} {who:<16} {text[:150]}")
+    return "\n".join(lines)
+
+
 # ---- commands ----------------------------------------------------------------
 
 def prepare(args):
@@ -193,6 +330,17 @@ def prepare(args):
     check_task(task, project)
     effective_limits(task, config.limits)  # refuses a task limit above the ceiling
     return config, task, project
+
+
+def cmd_sessions(args, style: Style) -> int:
+    print(format_sessions(style, SessionStore(args.runs_dir).all()))
+    return EXIT_PASSED
+
+
+def cmd_show(args, style: Style) -> int:
+    session = SessionStore(args.runs_dir).open(args.session)
+    print(format_session(style, session, history=args.history))
+    return EXIT_PASSED
 
 
 def cmd_projects(args, style: Style) -> int:
@@ -228,13 +376,29 @@ def cmd_run(args, style: Style) -> int:
     print(f"  Copy:    {run_copy.repo}")
     limits = effective_limits(task, config.limits)
     print(f"  Limits:  {limits.max_actions} actions, {limits.max_fix_rounds} fix rounds")
-    print(f"  Record:  {run_copy.run_dir / 'task.json'}")
+    print(f"  Session: {run_copy.run_id}  (python -m harness show {run_copy.run_id})")
     print(f"  Model:   {model_config.name} (thinking {'on' if model_config.think else 'off'})")
     print(heading(style, "Task"))
     print(task.description)
     print(heading(style, "Agent"))
 
-    report = run_task(
+    try:
+        report = run_with_progress(args, style, config, task, project, model_config, run_copy)
+    except KeyboardInterrupt:
+        print(style.yellow(f"\nThe session is saved and shows as interrupted: "
+                           f"python -m harness show {run_copy.run_id}"), file=sys.stderr)
+        raise
+    print()
+    print(format_agent(style, report.agent))
+    print(format_verification(style, report.verification))
+    print()
+    print(format_result(style, report))
+    print(f"Session: python -m harness show {run_copy.run_id}")
+    return EXIT_PASSED if report.passed else EXIT_FAILED
+
+
+def run_with_progress(args, style, config, task, project, model_config, run_copy) -> RunReport:
+    return run_task(
         task=task,
         task_path=args.task,
         config=config,
@@ -244,12 +408,6 @@ def cmd_run(args, style: Style) -> int:
         run_copy=run_copy,
         on_event=lambda e: print(format_event(style, e), flush=True),
     )
-    print()
-    print(format_agent(style, report.agent))
-    print(format_verification(style, report.verification))
-    print()
-    print(format_result(style, report))
-    return EXIT_PASSED if report.passed else EXIT_FAILED
 
 
 def cmd_baseline(args, style: Style) -> int:
@@ -290,6 +448,15 @@ def build_parser() -> argparse.ArgumentParser:
     baseline = sub.add_parser("baseline", help="run the task's final checks on the starting code")
     baseline.add_argument("task", type=Path, help="task file, e.g. tasks/invalid_quantity.toml")
     baseline.add_argument("--project", help=project_help)
+
+    runs_help = "folder with the run folders (default: workspace/runs)"
+    sessions = sub.add_parser("sessions", help="list saved sessions and their status")
+    sessions.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
+
+    show = sub.add_parser("show", help="show one session: task, progress, steps, checks, errors")
+    show.add_argument("session", help="session ID, or a unique start or end of it")
+    show.add_argument("--history", action="store_true", help="also list the saved conversation")
+    show.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
     return parser
 
 
@@ -298,10 +465,11 @@ def main(argv: list[str] | None = None) -> int:
     style = Style()
     command = {
         "projects": cmd_projects, "fetch": cmd_fetch, "run": cmd_run, "baseline": cmd_baseline,
+        "sessions": cmd_sessions, "show": cmd_show,
     }[args.command]
     try:
         return command(args, style)
-    except (WorkspaceError, ValueError, FileNotFoundError) as exc:
+    except (WorkspaceError, SessionError, ValueError, FileNotFoundError) as exc:
         print(style.red(f"Setup problem: {exc}"), file=sys.stderr)
         return EXIT_SETUP
     except KeyboardInterrupt:

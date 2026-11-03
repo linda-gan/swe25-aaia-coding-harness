@@ -19,6 +19,11 @@ Every action and every finish attempt is a step. Each step is attached to its
 tool result (for the context summary) and passed to on_step (for the task
 record), with its phase: exploring, editing, checking, finish checks, or
 fix round N for everything after the Nth failed finish.
+
+For sessions, on_pending is called just before an action or the finish
+checks run (so an interruption during it can be detected later), and
+on_checkpoint after every completed step and when the run stops. The
+controller itself never writes files.
 """
 from __future__ import annotations
 
@@ -69,6 +74,8 @@ class RunResult:
     retries: int = 0  # replies without a usable tool call
     fix_rounds: int = 0  # finish attempts whose agent checks failed
     steps: int = 0  # steps recorded: actions plus finish attempts
+    stop_detail: str = ""  # e.g. the model error message
+    checks: list[dict] = field(default_factory=list)  # every check run during the agent loop
     duration_seconds: float = 0.0  # from the first model request to the stop
     messages: list[dict] = field(default_factory=list)  # full history, never shortened
     events: list[Event] = field(default_factory=list)
@@ -96,6 +103,8 @@ class AgentController:
         navigator: CodeNavigator | None = None,
         context: ContextConfig | None = None,
         on_step: Callable[[dict], None] | None = None,
+        on_pending: Callable[[dict], None] | None = None,
+        on_checkpoint: Callable[[RunResult, dict], None] | None = None,
     ):
         self.model = model
         self.tools = tools
@@ -107,6 +116,8 @@ class AgentController:
         self.limits = limits
         self.on_event = on_event
         self.on_step = on_step
+        self.on_pending = on_pending
+        self.on_checkpoint = on_checkpoint
         self.schemas = tool_schemas(task.agent_checks)
 
     # ---- the loop ----------------------------------------------------------
@@ -141,6 +152,7 @@ class AgentController:
                 if retries_in_a_row > self.limits.max_retries:
                     return self._stop(run, RETRY_LIMIT)
                 run.messages.append({"role": "user", "content": NO_TOOL_CALL_NUDGE})
+                self._checkpoint(run)
                 continue
             retries_in_a_row = 0
 
@@ -158,6 +170,7 @@ class AgentController:
                                           self._record(run, None, ok=False, status="refused"))
                     if run.denied > self.limits.max_denied_actions:
                         return self._stop(run, DENIED_LIMIT)
+                    self._checkpoint(run)
                     continue
 
                 # 2. finish: the harness runs the agent checks. Not counted as an action.
@@ -173,6 +186,8 @@ class AgentController:
                     return self._stop(run, ACTION_LIMIT)
                 run.actions += 1
                 self._emit(run, "action", _describe(action))
+                self._pending(run, action.name, _target(action), run.actions)
+                self._last_check = None
                 try:
                     output = self._execute(action)
                 except (ToolError, SandboxError) as exc:
@@ -182,14 +197,18 @@ class AgentController:
                                           self._record(run, action, ok=False, status="error"))
                     if run.denied > self.limits.max_denied_actions:
                         return self._stop(run, DENIED_LIMIT)
+                    self._checkpoint(run)
                     continue
                 except Exception as exc:  # a bug in the harness, not the model
                     return self._stop(run, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
 
                 self._emit(run, "result", output.splitlines()[0] if output else "(no output)")
-                status = self._check_status if action.name == "run_check" else None
-                self._add_tool_result(run, action.name, output,
-                                      self._record(run, action, ok=True, status=status))
+                check = self._last_check
+                step = self._record(run, action, ok=True, status=check.status if check else None)
+                if check:
+                    self._keep_check(run, check, "model", step["step"])
+                self._add_tool_result(run, action.name, output, step)
+                self._checkpoint(run)
 
     # ---- the edit-test-fix loop ---------------------------------------------
 
@@ -205,6 +224,7 @@ class AgentController:
 
         names = ", ".join(self.task.agent_checks)
         self._emit(run, "finish", f"The model called finish. The harness runs: {names}")
+        self._pending(run, "finish checks", names, None)
         results = [self.sandbox.run_check(name) for name in self.task.agent_checks]
         for result in results:
             self._emit(run, "check", f"{result.name} {result.status.upper()}")
@@ -214,6 +234,8 @@ class AgentController:
         summary = ", ".join(f"{r.name} {r.status}" for r in results)
         step = self._record(run, None, ok=passed, status=status, tool="finish",
                             target=summary)
+        for result in results:
+            self._keep_check(run, result, "finish", step["step"])
 
         if passed:
             return self._stop(run, FINISHED, run.summary)
@@ -234,6 +256,7 @@ class AgentController:
         )})
         self._emit(run, "retry", f"Checks failed: fix round {run.fix_rounds} of "
                                  f"{self.limits.max_fix_rounds}")
+        self._checkpoint(run)
         return None
 
     # ---- tools -------------------------------------------------------------
@@ -260,7 +283,7 @@ class AgentController:
             return self.tools.edit_file(args["path"], args["old"], args["new"])
         if action.name == "run_check":
             result = self.sandbox.run_check(args["name"])
-            self._check_status = result.status  # for the harness's own step record
+            self._last_check = result  # for the step record and the session
             return format_check(result)
         raise RuntimeError(f"No handler for validated action {action.name!r}")
 
@@ -275,13 +298,7 @@ class AgentController:
         """
         tool = tool or (action.name if action else "refused request")
         if action is not None and target is None:
-            args = action.arguments
-            if action.name in PATH_TOOLS and "path" in args:
-                target = normalize_path(args["path"])[:200]
-            elif action.name == "run_check":
-                target = args["name"]  # validated against the task's checks
-            elif action.name == "find_symbol" and IDENTIFIER.fullmatch(args["name"].strip()):
-                target = args["name"].strip()
+            target = _target(action)
         if run.fix_rounds:
             phase = f"fix round {run.fix_rounds}"
         elif tool == "finish":
@@ -297,6 +314,24 @@ class AgentController:
             self.on_step(step)
         return step
 
+    def _pending(self, run: RunResult, tool: str, target: str | None, action: int | None) -> None:
+        """Announce the step that is about to run, before it runs."""
+        if self.on_pending:
+            self.on_pending({"step": run.steps + 1, "action": action, "tool": tool,
+                             "target": target})
+
+    def _checkpoint(self, run: RunResult) -> None:
+        if self.on_checkpoint:
+            self.on_checkpoint(run, self.context.state())
+
+    @staticmethod
+    def _keep_check(run: RunResult, result: CheckResult, by: str, step: int) -> None:
+        run.checks.append({
+            "step": step, "by": by, "name": result.name, "status": result.status,
+            "exit_code": result.exit_code, "duration_seconds": round(result.duration_seconds, 2),
+            "error": result.error, "output_tail": result.output[-1500:],
+        })
+
     def _add_tool_result(self, run: RunResult, name: str, content: str, step: dict) -> None:
         content = shorten(content, self.limits.max_tool_output_chars)
         run.messages.append({"role": "tool", "tool_name": _short(name), "content": content,
@@ -310,9 +345,11 @@ class AgentController:
 
     def _stop(self, run: RunResult, reason: str, detail: str = "") -> RunResult:
         run.stop_reason = reason
+        run.stop_detail = detail
         run.context = self.context.stats()
         run.duration_seconds = round(time.monotonic() - self._start, 1)
         self._emit(run, "stop", f"{reason}: {detail}" if detail else reason)
+        self._checkpoint(run)
         return run
 
 
@@ -350,3 +387,15 @@ def _short(value, limit: int = 60) -> str:
 # Tools whose validated argument may appear in the harness's step records.
 PATH_TOOLS = {"list_files", "read_file", "outline", "dependencies", "git_diff", "edit_file"}
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+
+def _target(action: Action) -> str | None:
+    """The validated argument of an action that may appear in records."""
+    args = action.arguments
+    if action.name in PATH_TOOLS and "path" in args:
+        return normalize_path(args["path"])[:200]
+    if action.name == "run_check":
+        return args["name"]  # validated against the task's checks
+    if action.name == "find_symbol" and IDENTIFIER.fullmatch(args["name"].strip()):
+        return args["name"].strip()
+    return None

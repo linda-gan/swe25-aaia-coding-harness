@@ -254,6 +254,16 @@ class ContextManager:
         """Tokens for messages plus tool definitions, as the Ollama client estimates them."""
         return len(json.dumps({"messages": sendable, "tools": self.tool_schemas})) // CHARS_PER_TOKEN
 
+    def state(self) -> dict:
+        """Everything needed to rebuild the same view later (for sessions)."""
+        return {
+            "nonce": self.nonce,
+            "stubbed": sorted(self.stubbed),
+            "overview_removed": self.overview_removed,
+            "compactions": self.compactions,
+            "largest_request": self.largest_request,
+        }
+
     def stats(self) -> dict:
         return {
             "max_tokens": self.config.max_tokens,

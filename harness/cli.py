@@ -1,10 +1,20 @@
-"""Command-line interface.
+"""Command-line interface. Parses arguments and prints; the work is done in
+the core modules (runner, projects, workspace).
 
+    python -m harness projects                             allowed projects and their tasks
+    python -m harness fetch cosmicpython                   make the project's pristine clone
     python -m harness run tasks/invalid_quantity.toml      agent run + verification
     python -m harness baseline tasks/invalid_quantity.toml checks on the starting code
+    python -m harness sessions                             saved sessions and their status
+    python -m harness show <session id>                    one session in detail
+    python -m harness cancel <session id>                  stop a running session
+    python -m harness resume <session id>                  continue a stopped session safely
+    python -m harness review <session id>                  run the final checks again on it
+
+run and baseline take --project NAME; it must be allowed and match the task.
 
 Exit codes: 0 all checks passed, 1 checks failed, 2 setup problem,
-130 interrupted with Ctrl+C.
+3 resume paused (see the reasons), 130 cancelled (Ctrl+C or cancel).
 """
 from __future__ import annotations
 
@@ -14,14 +24,24 @@ import os
 import sys
 from pathlib import Path
 
-from harness.config import load_config, load_task
+from harness.config import PROJECT_ROOT, HarnessConfig, load_config, load_task
 from harness.controller import Event, RunResult
 from harness.ollama_client import OllamaClient
-from harness.runner import RunReport, check_task, make_sandbox, run_task
-from harness.verification import VerificationReport, verify
-from harness.workspace import WorkspaceError, create_run_copy
+from harness.projects import TaskEntry, list_tasks, pristine_status, select_project
+from harness.baseline import BaselineSandbox
+from harness.cancellation import Cancelled
+from harness.resume import ResumeCheck
+from harness.runner import (
+    RunReport, capture_baselines, check_task, effective_limits, make_sandbox, resume_task,
+    review_session, run_task,
+)
+from harness.session import (
+    CANCELLED, INTERRUPTED, PAUSED, RUNNING, VERIFYING, Session, SessionError, SessionStore,
+)
+from harness.verification import VerificationReport, check_summaries, unfinished_work, verify
+from harness.workspace import RUNS_DIR, WorkspaceError, create_project_copy, fetch_project
 
-EXIT_PASSED, EXIT_FAILED, EXIT_SETUP, EXIT_INTERRUPTED = 0, 1, 2, 130
+EXIT_PASSED, EXIT_FAILED, EXIT_SETUP, EXIT_PAUSED, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 
 
 # ---- colors ------------------------------------------------------------------
@@ -44,12 +64,15 @@ class Style:
     def yellow(self, t): return self._wrap("33", t)
     def cyan(self, t): return self._wrap("36", t)
 
-    def status(self, status: str) -> str:
-        label = status.upper()
+    def status(self, status: str, width: int = 0) -> str:
+        """PASSED in green, anything else in red. Padded before coloring, because
+        color codes would otherwise count as characters and break the columns."""
+        label = status.upper().ljust(width)
         return self.green(label) if status == "passed" else self.red(label)
 
 
-EVENT_COLORS = {"thinking": "dim", "refused": "red", "retry": "yellow", "stop": "bold"}
+EVENT_COLORS = {"thinking": "dim", "refused": "red", "retry": "yellow", "stop": "bold",
+                "finish": "cyan", "check": "cyan", "context": "yellow"}
 
 
 # ---- formatting --------------------------------------------------------------
@@ -68,7 +91,7 @@ def format_agent(style: Style, agent: RunResult) -> str:
     lines = [
         f"Agent stopped: {style.bold(agent.stop_reason)} "
         f"({agent.actions} actions, {agent.denied} refused, {agent.retries} retries, "
-        f"{agent.duration_seconds:.1f}s)"
+        f"{agent.fix_rounds} fix rounds, {agent.duration_seconds:.1f}s)"
     ]
     if agent.summary:
         lines.append(f"Model's summary: {agent.summary}")
@@ -98,18 +121,19 @@ def format_diff(style: Style, diff_text: str) -> str:
 
 def format_verification(style: Style, report: VerificationReport) -> str:
     lines = [heading(style, "Verification (run by the harness, not the model)")]
+    width = max([12, *(len(check.name) for check in report.checks)])  # name column
     for check in report.checks:
         detail = check.error or last_line(check.output) or "(no output)"
-        lines.append(f"  {check.name:<12} {style.status(check.status):<8}  {detail}")
+        lines.append(f"  {check.name:<{width}} {style.status(check.status, 8)}  {detail}")
         if not check.passed and check.output.strip():
             # Failed, timed-out and unavailable checks show their output.
             lines.extend("      " + line for line in check.output.rstrip().splitlines())
 
     scope = report.scope
     if scope.passed:
-        lines.append(f"  {'scope':<12} {style.status('passed'):<8}  only editable files changed")
+        lines.append(f"  {'scope':<{width}} {style.status('passed', 8)}  only editable files changed")
     else:
-        lines.append(f"  {'scope':<12} {style.status('failed'):<8}  "
+        lines.append(f"  {'scope':<{width}} {style.status('failed', 8)}  "
                      f"changed outside the task: {', '.join(scope.outside)}")
 
     lines.append(heading(style, "Changed files"))
@@ -127,7 +151,8 @@ def format_result(style: Style, report: RunReport) -> str:
     lines = []
     if report.agent.finished and not report.passed:
         lines.append(style.yellow(
-            "Note: the model reported the task as done, but the checks did not pass."))
+            "Note: the model reported the task as done and its own checks passed, "
+            "but the final checks did not pass."))
     if not report.agent.finished:
         lines.append(style.yellow(
             f"Note: the agent did not finish ({report.agent.stop_reason}). "
@@ -142,59 +167,464 @@ def format_result(style: Style, report: RunReport) -> str:
     return "\n".join(lines)
 
 
+def shown_path(path: Path) -> str:
+    """A path relative to the harness folder when it lies inside it."""
+    path = Path(path).resolve()
+    return str(path.relative_to(PROJECT_ROOT)) if path.is_relative_to(PROJECT_ROOT) else str(path)
+
+
+def format_projects(style: Style, config: HarnessConfig, statuses: dict[str, str],
+                    tasks: list[TaskEntry]) -> str:
+    lines = [style.bold("Allowed projects (config/target.toml)")]
+    for name, project in config.projects.items():
+        status = statuses[name]
+        lines.append(heading(style, name))
+        lines.append(f"  Repository: {project.url}")
+        lines.append(f"  Commit:     {project.commit}")
+        lines.append(f"  Image:      {project.sandbox.image}")
+        lines.append(f"  Clone:      {shown_path(project.pristine)} "
+                     f"({style.green(status) if status == 'ready' else style.yellow(status)})")
+        lines.append(f"  Checks:     {', '.join(project.checks)}")
+        own = [t for t in tasks if t.task is not None and t.task.project == name]
+        lines.append("  Tasks:      " + (", ".join(shown_path(t.path) for t in own) or "(none)"))
+
+    other = [t for t in tasks if t.task is not None and t.task.project not in config.projects]
+    if other:
+        lines.append(heading(style, "Tasks for projects that are not allowed (cannot run)"))
+        lines.extend(f"  {shown_path(t.path)}  (project {t.task.project!r})" for t in other)
+    broken = [t for t in tasks if t.task is None]
+    if broken:
+        lines.append(heading(style, "Task files that could not be loaded"))
+        lines.extend(f"  {shown_path(t.path)}: {t.error}" for t in broken)
+    return "\n".join(lines)
+
+
+STATUS_COLORS = {"passed": "green", "failed": "red", INTERRUPTED: "yellow",
+                 CANCELLED: "yellow", PAUSED: "yellow", "running": "cyan", "verifying": "cyan"}
+
+
+def color_status(style: Style, status: str, width: int = 0) -> str:
+    """Padded before coloring, so the columns stay aligned."""
+    return getattr(style, STATUS_COLORS.get(status, "bold"))(status.ljust(width))
+
+
+def format_sessions(style: Style, sessions: list[Session]) -> str:
+    if not sessions:
+        return "No sessions yet. Start one with: python -m harness run <task file>"
+    lines = [style.bold(f"{'Session':<24} {'Status':<12} {'Steps':>5} {'Actions':>8} "
+                        f"{'Fix':>4}  {'Updated':<19}  Task")]
+    for session in sessions:
+        data, record = session.data, session.task_record()
+        limit = record.data["limits"]["max_actions"] if record else "?"
+        counters = data["counters"]
+        status = session.status
+        lines.append(
+            f"{session.session_id:<24} {color_status(style, status, 12)} "
+            f"{counters['steps']:>5} {str(counters['actions']) + '/' + str(limit):>8} "
+            f"{counters['fix_rounds']:>4}  {data['updated_at']:<19}  {shown_path(data['task_file'])}"
+        )
+        if session.uncertain_action:
+            lines.append(style.yellow(f"{'':<24} uncertain: {describe_pending(session.uncertain_action)}"))
+    return "\n".join(lines)
+
+
+def describe_pending(pending: dict) -> str:
+    target = f" {pending['target']}" if pending.get("target") else ""
+    text = f"{pending['tool']}{target}"
+    if pending.get("step") is not None:
+        text = f"step {pending['step']} ({text})"
+    if pending.get("started_at"):
+        text += f", started {pending['started_at']}"
+    return text
+
+
+def format_session(style: Style, session: Session, history: bool = False) -> str:
+    data, record = session.data, session.task_record()
+    counters, status = data["counters"], session.status
+    task = record.data if record else {}
+    limits = task.get("limits", {})
+    lines = [style.bold(f"Session {session.session_id}")]
+    lines.append(f"  Status:   {color_status(style, status)}")
+    if data.get("cancel_reason") and status == CANCELLED:
+        lines.append(f"  Cancelled by: {data['cancel_reason']}")
+    if status == PAUSED and data.get("pause_reasons"):
+        lines.append(style.yellow("  Paused, because:"))
+        lines.extend(style.yellow(f"    - {reason}") for reason in data["pause_reasons"])
+    if data.get("resumes"):
+        for entry in data["resumes"]:
+            accepted = f"; accepted: {len(entry['accepted'])} item(s)" if entry["accepted"] else ""
+            lines.append(f"  Resumed:  {entry['at']} from {entry['from_status']}{accepted}")
+    if session.uncertain_action:
+        lines.append(style.yellow(
+            f"  Uncertain action: {describe_pending(session.uncertain_action)}. The run stopped "
+            "while it was in progress, so it is not known whether it completed."))
+    lines.append(f"  Task:     {shown_path(data['task_file'])}")
+    if task:
+        lines.append(f"  Project:  {task['project']['name']} at starting commit "
+                     f"{task['starting_commit'][:12]}")
+    lines.append(f"  Model:    {data['model']}")
+    lines.append(f"  Copy:     {data['repo']}")
+    lines.append(f"  Updated:  {data['updated_at']} (created {data['created_at']})")
+    lines.append(f"  Used:     {counters['actions']} of {limits.get('max_actions', '?')} actions, "
+                 f"{counters['denied']} refused, {counters['retries']} retries, "
+                 f"{counters['fix_rounds']} of {limits.get('max_fix_rounds', '?')} fix rounds")
+    stopped = data["stop_reason"] or "(not stopped)"
+    if data.get("stop_detail") and data["stop_reason"] != "finished":
+        stopped += f": {data['stop_detail']}"
+    lines.append(f"  Stopped:  {stopped}")
+
+    if task:
+        lines.append(heading(style, "Request"))
+        lines.extend("  " + line for line in task["request"].splitlines())
+        lines.append(heading(style, "Allowed changes"))
+        lines.extend(f"  {path}" for path in task["allowed_changes"])
+
+    progress = session.progress()
+    lines.append(heading(style, "Progress (steps per phase)"))
+    lines.append("  " + (", ".join(f"{phase} {n}" for phase, n in progress.items()) or "(no steps yet)"))
+
+    lines.append(heading(style, "Steps"))
+    for step in (record.steps if record else []):
+        target = f" {step['target']}" if step.get("target") else ""
+        outcome = step.get("status") or ("ok" if step["ok"] else "error")
+        line = f"  {step['step']:>3}  {step['phase']:<14} {step['tool']}{target}  [{outcome}]"
+        lines.append(line if step["ok"] else style.red(line))
+    # A step that started but did not complete: running now, or uncertain.
+    open_step = session.uncertain_action or (data.get("pending_action")
+                                             if status in ("running", "verifying") else None)
+    if open_step:
+        label = "running now" if status in ("running", "verifying") else "UNCERTAIN"
+        number = open_step["step"] if open_step.get("step") is not None else "-"
+        lines.append(style.yellow(f"  {number:>3}  {label:<14} {open_step['tool']}"
+                                  f"{' ' + open_step['target'] if open_step.get('target') else ''}"))
+
+    lines.append(heading(style, "Checks during the run"))
+    if data["checks"]:
+        for check in data["checks"]:
+            lines.append(f"  step {check['step']:>3}  by {check['by']:<6} {check['name']:<20} "
+                         f"{style.status(check['status'])}")
+    else:
+        lines.append("  (none)")
+
+    lines.append(heading(style, "Errors"))
+    if data["errors"]:
+        for error in data["errors"]:
+            where = f"step {error['step']}" if error["step"] else "run"
+            first = error["message"].splitlines()[0]
+            lines.append(style.red(f"  {where}: {first}"))
+    else:
+        lines.append("  (none)")
+
+    lines.append(heading(style, "Working copy (changed files)"))
+    files = data["working_copy"]["files"]
+    if files:
+        lines.extend(f"  {path}  {(digest or 'deleted')[:12]}" for path, digest in files.items())
+    else:
+        lines.append("  (no changes)")
+
+    lines.append(heading(style, "Final verification"))
+    verification = data.get("verification")
+    if verification:
+        width = max([12, *(len(c["name"]) for c in verification["checks"])])
+        for check in verification["checks"]:
+            detail = check["error"] or last_line(check["output_tail"]) or ""
+            lines.append(f"  {check['name']:<{width}} {style.status(check['status'], 8)}  {detail}")
+        scope = verification["scope"]
+        lines.append(f"  {'scope':<{width}} {style.status('passed' if scope['passed'] else 'failed', 8)}"
+                     + ("" if scope["passed"] else f"  changed outside the task: {', '.join(scope['outside'])}"))
+        lines.append(style.bold(style.green("  RESULT: PASSED") if verification["passed"]
+                                else style.red("  RESULT: FAILED")))
+    else:
+        lines.append("  not run" + {INTERRUPTED: " (the session was interrupted)",
+                                     CANCELLED: " (the session was cancelled)"}.get(status, " yet"))
+
+    if data.get("reviews"):
+        lines.append(heading(style, "Reviews (final checks run again later)"))
+        for review in data["reviews"]:
+            summary = ", ".join(f"{c['name']} {c['status']}" for c in review["checks"])
+            result = style.green("PASSED") if review["passed"] else style.red("FAILED")
+            lines.append(f"  {review['at']}  {result}  ({summary})")
+        if session.current_review is None:
+            lines.append("  The session changed after the latest review (it was resumed).")
+
+    lines.append(format_unfinished(style, session_unfinished(session)))
+    if session.current_review is not None:
+        lines.append(f"  (judged by the latest review, {session.current_review['at']})")
+
+    lines.append(heading(style, "History"))
+    messages = data["messages"]
+    lines.append(f"  {len(messages)} messages saved"
+                 + ("" if history else "; show them with --history"))
+    if history:
+        for i, message in enumerate(messages):
+            who = message["role"] + (f" {message['tool_name']}" if message.get("tool_name") else "")
+            text = " ".join(str(message.get("content", "")).split())
+            if message.get("tool_calls"):
+                text += " -> " + ", ".join(c["function"]["name"] for c in message["tool_calls"])
+            lines.append(f"  {i:>3} {who:<16} {text[:150]}")
+    return "\n".join(lines)
+
+
+def format_resume_check(style: Style, check: ResumeCheck, accept: bool) -> str:
+    lines = [heading(style, "Checks before resuming")]
+    lines.extend(style.green(f"  ok       {item}") for item in check.passed)
+    lines.extend(style.red(f"  BLOCKED  {item}") for item in check.blocking)
+    label = "ACCEPTED" if accept else "DECIDE  "
+    lines.extend(style.yellow(f"  {label} {item}") for item in check.decisions)
+    lines.extend(f"  note     {item}" for item in check.notes)
+    return "\n".join(lines)
+
+
+def format_unfinished(style: Style, items: list[str]) -> str:
+    lines = [heading(style, "Unfinished work")]
+    if items:
+        lines.extend(style.yellow(f"  - {item}") for item in items)
+    else:
+        lines.append("  (none: the agent finished, and every final check and the scope "
+                     "check passed)")
+    return "\n".join(lines)
+
+
+def report_unfinished(report: RunReport) -> list[str]:
+    verification = report.verification
+    return unfinished_work(
+        report.agent.stop_reason, report.agent.stop_detail, report.agent.interrupted_action,
+        check_summaries(verification) if verification else None,
+        verification.scope.outside if verification else [])
+
+
+def session_unfinished(session: Session, verification: VerificationReport | None = None) -> list[str]:
+    """Unfinished work of a saved session, judged by the newest check results:
+    a review running now (verification), else the latest review if it is still
+    current, else the final verification of the run."""
+    data, status = session.data, session.status
+    if status in (RUNNING, VERIFYING):
+        return ["The session is still running; what is unfinished is known once it stops."]
+    stopped_as = data.get("paused_from") if status == PAUSED else status
+    if stopped_as == CANCELLED:
+        reason, detail = "cancelled", data.get("cancel_reason") or ""
+    elif stopped_as in (INTERRUPTED, PAUSED, None):
+        reason, detail = "", ""
+    else:
+        reason, detail = data.get("stop_reason") or "", data.get("stop_detail") or ""
+    review = session.current_review
+    if verification is not None:
+        checks, outside = check_summaries(verification), verification.scope.outside
+    elif review is not None:
+        checks, outside = review["checks"], review["outside"]
+    elif data.get("verification"):
+        saved = data["verification"]
+        checks = [{"name": c["name"], "status": c["status"],
+                   "detail": c["error"] or last_line(c["output_tail"])} for c in saved["checks"]]
+        outside = saved["scope"]["outside"]
+    else:
+        checks, outside = None, []
+    items = unfinished_work(reason, detail, session.uncertain_action, checks, outside)
+    if status == PAUSED:
+        items.insert(0, "The session is paused; see the reasons above.")
+    return items
+
+
+def print_run_outcome(style: Style, report: RunReport, session_id: str) -> int:
+    """The end of a run or a resumed run: agent, verification, result."""
+    print()
+    print(format_agent(style, report.agent))
+    if report.cancelled:
+        print(style.yellow(f"Cancelled ({report.agent.stop_detail}). No further actions ran, "
+                           "and no verification was run."))
+        if report.agent.interrupted_action:
+            print(style.yellow("Uncertain action: "
+                               f"{describe_pending(report.agent.interrupted_action)}"))
+        print(format_unfinished(style, report_unfinished(report)))
+        print(f"Session: python -m harness show {session_id}")
+        return EXIT_INTERRUPTED
+    print(format_verification(style, report.verification))
+    print(format_unfinished(style, report_unfinished(report)))
+    print()
+    print(format_result(style, report))
+    print(f"Session: python -m harness show {session_id}")
+    return EXIT_PASSED if report.passed else EXIT_FAILED
+
+
 # ---- commands ----------------------------------------------------------------
 
-def cmd_run(args, style: Style) -> int:
+def prepare(args):
+    """Load the config and the task, and select the project: refuse early if anything is off."""
     config = load_config()
     task = load_task(args.task)
-    check_task(task, config)
+    project = select_project(config, task, args.project)
+    check_task(task, project)
+    effective_limits(task, config.limits)  # refuses a task limit above the ceiling
+    return config, task, project
+
+
+def cmd_sessions(args, style: Style) -> int:
+    print(format_sessions(style, SessionStore(args.runs_dir).all()))
+    return EXIT_PASSED
+
+
+def cmd_show(args, style: Style) -> int:
+    session = SessionStore(args.runs_dir).open(args.session)
+    print(format_session(style, session, history=args.history))
+    return EXIT_PASSED
+
+
+def cmd_cancel(args, style: Style) -> int:
+    store = SessionStore(args.runs_dir)
+    session = store.open(args.session)
+    pid = session.request_cancel()
+    print(f"Cancel requested for session {session.session_id} (process {pid}).")
+    print(f"Waiting up to {args.wait:g}s for it to stop at a safe point...")
+    if not session.wait_until_stopped(args.wait):
+        print(style.yellow("It has not stopped yet. Check again with: python -m harness sessions"))
+        return EXIT_FAILED
+    session = Session.load(session.run_dir)
+    print(f"Stopped. Status: {color_status(style, session.status)}")
+    if session.uncertain_action:
+        print(style.yellow(f"Uncertain action: {describe_pending(session.uncertain_action)}"))
+    print(f"Details: python -m harness show {session.session_id}")
+    return EXIT_PASSED
+
+
+def cmd_resume(args, style: Style) -> int:
+    config = load_config()
+    session = SessionStore(args.runs_dir).open(args.session)
+    model_config = config.model
+    if args.model:
+        model_config = dataclasses.replace(model_config, name=args.model)
+    if args.no_think:
+        model_config = dataclasses.replace(model_config, think=False)
+    print(style.bold(f"Resuming session {session.session_id}"))
+    print(f"  Status:  {color_status(style, session.status)}")
+    print(f"  Task:    {shown_path(session.data['task_file'])}")
+    print(f"  Model:   {model_config.name} (thinking {'on' if model_config.think else 'off'})")
+
+    def show_check(check: ResumeCheck) -> None:
+        print(format_resume_check(style, check, args.accept_current_state))
+        if check.can_resume(args.accept_current_state):
+            print(heading(style, "Agent (continued)"))
+
+    try:
+        outcome = resume_task(
+            session, config, OllamaClient(model_config), model_config.name,
+            accept_current_state=args.accept_current_state,
+            on_event=lambda e: print(format_event(style, e), flush=True),
+            on_check=show_check,
+        )
+    except KeyboardInterrupt:
+        print(style.yellow(f"\nThe session is saved: python -m harness show {session.session_id}"),
+              file=sys.stderr)
+        raise
+    if outcome.report is None:
+        print()
+        print(style.yellow(f"Not resumed. The session is {Session.load(session.run_dir).status}."))
+        if outcome.check.blocking:
+            print("Fix the BLOCKED items first; they cannot be overridden.")
+        elif outcome.check.decisions:
+            print("If the current state is what you want, resume with --accept-current-state. "
+                  "The uncertain action will not be repeated; the model is told about it.")
+        print(f"Details: python -m harness show {session.session_id}")
+        return EXIT_PAUSED
+    return print_run_outcome(style, outcome.report, session.session_id)
+
+
+def cmd_review(args, style: Style) -> int:
+    config = load_config()
+    session = SessionStore(args.runs_dir).open(args.session)
+    print(style.bold(f"Review of session {session.session_id}"))
+    print(f"  Status:  {color_status(style, session.status)} (a review does not change it)")
+    print(f"  Task:    {shown_path(session.data['task_file'])}")
+    print(f"  Copy:    {session.data['repo']}")
+    print("  The final checks run again on the working copy as it is now.")
+    try:
+        verification = review_session(session, config)
+    except Cancelled:
+        print(style.yellow("Review cancelled; nothing was logged, and the session is unchanged."))
+        return EXIT_INTERRUPTED
+    print(format_verification(style, verification))
+    print(format_unfinished(style, session_unfinished(session, verification)))
+    print()
+    print(style.bold(style.green("REVIEW: PASSED - all final checks pass on the current state.")
+                     if verification.passed else
+                     style.red("REVIEW: FAILED - see the checks above.")))
+    return EXIT_PASSED if verification.passed else EXIT_FAILED
+
+
+def cmd_projects(args, style: Style) -> int:
+    config = load_config()
+    statuses = {name: pristine_status(project) for name, project in config.projects.items()}
+    print(format_projects(style, config, statuses, list_tasks()))
+    return EXIT_PASSED
+
+
+def cmd_fetch(args, style: Style) -> int:
+    project = load_config().project(args.project)  # only allowed projects can be fetched
+    print(f"Fetching {project.name}: {project.url} @ {project.commit[:12]}")
+    if fetch_project(project, force=args.force):
+        print(style.green(f"Pristine clone ready at {shown_path(project.pristine)}."))
+    else:
+        print(f"The pristine clone at {shown_path(project.pristine)} is already at the pinned "
+              "commit and unchanged; nothing to do (--force fetches it again).")
+    return EXIT_PASSED
+
+
+def cmd_run(args, style: Style) -> int:
+    config, task, project = prepare(args)
     model_config = config.model
     if args.model:
         model_config = dataclasses.replace(model_config, name=args.model)
     if args.no_think:
         model_config = dataclasses.replace(model_config, think=False)
 
-    run_copy = create_run_copy(config.target.commit)
+    run_copy = create_project_copy(project)
     print(style.bold("Coding harness"))
-    print(f"  Task:   {args.task}")
-    print(f"  Target: {config.target.url} @ {config.target.commit[:12]}")
-    print(f"  Copy:   {run_copy.repo}")
-    print(f"  Model:  {model_config.name} (thinking {'on' if model_config.think else 'off'})")
+    print(f"  Task:    {args.task}")
+    print(f"  Project: {project.name} ({project.url} @ {project.commit[:12]})")
+    print(f"  Copy:    {run_copy.repo}")
+    limits = effective_limits(task, config.limits)
+    print(f"  Limits:  {limits.max_actions} actions, {limits.max_fix_rounds} fix rounds")
+    print(f"  Session: {run_copy.run_id}  (python -m harness show {run_copy.run_id})")
+    print(f"  Model:   {model_config.name} (thinking {'on' if model_config.think else 'off'})")
     print(heading(style, "Task"))
     print(task.description)
     print(heading(style, "Agent"))
 
-    report = run_task(
+    try:
+        report = run_with_progress(args, style, config, task, project, model_config, run_copy)
+    except KeyboardInterrupt:
+        print(style.yellow(f"\nThe session is saved and shows as interrupted: "
+                           f"python -m harness show {run_copy.run_id}"), file=sys.stderr)
+        raise
+    return print_run_outcome(style, report, run_copy.run_id)
+
+
+def run_with_progress(args, style, config, task, project, model_config, run_copy) -> RunReport:
+    return run_task(
         task=task,
         task_path=args.task,
         config=config,
+        project=project,
         model=OllamaClient(model_config),
         model_name=model_config.name,
         run_copy=run_copy,
         on_event=lambda e: print(format_event(style, e), flush=True),
     )
-    print()
-    print(format_agent(style, report.agent))
-    print(format_verification(style, report.verification))
-    print()
-    print(format_result(style, report))
-    return EXIT_PASSED if report.passed else EXIT_FAILED
 
 
 def cmd_baseline(args, style: Style) -> int:
     """Run the final checks on the unchanged code, to show the starting state."""
-    config = load_config()
-    task = load_task(args.task)
-    check_task(task, config)
-    run_copy = create_run_copy(config.target.commit)
+    config, task, project = prepare(args)
+    run_copy = create_project_copy(project)
     print(style.bold("Baseline: final checks on the unchanged starting code"))
-    print(f"  Target: {config.target.url} @ {config.target.commit[:12]}")
-    print(f"  Copy:   {run_copy.repo}")
-    report = verify(make_sandbox(run_copy, config), run_copy.repo, task)
+    print(f"  Project: {project.name} ({project.url} @ {project.commit[:12]})")
+    print(f"  Copy:    {run_copy.repo}")
+    baselines = capture_baselines(run_copy, project, task)
+    report = verify(BaselineSandbox(make_sandbox(run_copy, project, task), baselines),
+                    run_copy.repo, task)
     print(format_verification(style, report))
     print()
-    print("This is the starting state. For a bug-fix task the acceptance check "
-          "is expected to fail here.")
+    print("This is the starting state. For a new task, bug fix or feature, the "
+          "acceptance check is expected to fail here.")
     return EXIT_PASSED if report.passed else EXIT_FAILED
 
 
@@ -205,23 +635,63 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("projects", help="list the allowed projects, their clones and tasks")
+
+    fetch = sub.add_parser("fetch", help="make an allowed project's pristine clone")
+    fetch.add_argument("project", help="project name from config/target.toml, e.g. cosmicpython")
+    fetch.add_argument("--force", action="store_true", help="fetch again even if the clone is fine")
+
+    project_help = "project to work on; must be allowed and match the task (default: the task's)"
     run = sub.add_parser("run", help="run the agent on a task, then verify the result")
     run.add_argument("task", type=Path, help="task file, e.g. tasks/invalid_quantity.toml")
+    run.add_argument("--project", help=project_help)
     run.add_argument("--model", help="Ollama model name (default: from config)")
     run.add_argument("--no-think", action="store_true", help="turn thinking mode off")
 
     baseline = sub.add_parser("baseline", help="run the task's final checks on the starting code")
     baseline.add_argument("task", type=Path, help="task file, e.g. tasks/invalid_quantity.toml")
+    baseline.add_argument("--project", help=project_help)
+
+    runs_help = "folder with the run folders (default: workspace/runs)"
+    sessions = sub.add_parser("sessions", help="list saved sessions and their status")
+    sessions.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
+
+    show = sub.add_parser("show", help="show one session: task, progress, steps, checks, errors")
+    show.add_argument("session", help="session ID, or a unique start or end of it")
+    show.add_argument("--history", action="store_true", help="also list the saved conversation")
+    show.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
+
+    cancel = sub.add_parser("cancel", help="stop a running session at its next safe point")
+    cancel.add_argument("session", help="session ID, or a unique start or end of it")
+    cancel.add_argument("--wait", type=float, default=60, help="seconds to wait for it to stop")
+    cancel.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
+
+    resume = sub.add_parser("resume", help="continue a cancelled, interrupted or paused session")
+    resume.add_argument("session", help="session ID, or a unique start or end of it")
+    resume.add_argument("--accept-current-state", action="store_true",
+                        help="continue although the working copy differs from the checkpoint or "
+                             "an action was cut off (it is never repeated automatically)")
+    resume.add_argument("--model", help="Ollama model name (default: from config)")
+    resume.add_argument("--no-think", action="store_true", help="turn thinking mode off")
+    resume.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
+
+    review = sub.add_parser("review", help="run the final checks again on a session's working copy")
+    review.add_argument("session", help="session ID, or a unique start or end of it")
+    review.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=runs_help)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     style = Style()
-    command = {"run": cmd_run, "baseline": cmd_baseline}[args.command]
+    command = {
+        "projects": cmd_projects, "fetch": cmd_fetch, "run": cmd_run, "baseline": cmd_baseline,
+        "sessions": cmd_sessions, "show": cmd_show, "cancel": cmd_cancel, "resume": cmd_resume,
+        "review": cmd_review,
+    }[args.command]
     try:
         return command(args, style)
-    except (WorkspaceError, ValueError, FileNotFoundError) as exc:
+    except (WorkspaceError, SessionError, ValueError, FileNotFoundError) as exc:
         print(style.red(f"Setup problem: {exc}"), file=sys.stderr)
         return EXIT_SETUP
     except KeyboardInterrupt:

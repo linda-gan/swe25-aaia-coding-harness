@@ -7,11 +7,12 @@ the starting code and passes after the change).
 """
 import json
 import subprocess
+from dataclasses import replace
 
 import pytest
 
 from harness.cli import Style, format_result, format_verification
-from harness.config import load_config, Task
+from harness.config import ACCEPTANCE_ROOT, load_config, Task
 from harness.controller import FINISHED
 from harness.model import ScriptedModelClient, tool_reply
 from harness.runner import check_task, run_task
@@ -27,6 +28,7 @@ TASK = Task(
     editable_files=["src/app/model.py"],
     agent_checks=["unit_tests"],
     final_checks=["acceptance", "unit_tests"],
+    acceptance_dir=ACCEPTANCE_ROOT / "invalid_quantity",  # not read by FakeSandbox
 )
 
 
@@ -72,9 +74,16 @@ def config():
     return load_config()
 
 
+def project_for(run_copy, config):
+    """The project settings, pinned to the small test repository's commit."""
+    commit = git(run_copy.repo, "rev-parse", "HEAD").strip()
+    return replace(config.project("cosmicpython"), commit=commit)
+
+
 def run(run_copy, config, replies, sandbox_factory=FakeSandbox):
     return run_task(
         task=TASK, task_path="tasks/test.toml", config=config,
+        project=project_for(run_copy, config),
         model=ScriptedModelClient(replies), model_name="scripted",
         run_copy=run_copy, sandbox_factory=sandbox_factory,
     )
@@ -115,7 +124,8 @@ def test_model_says_done_without_fixing_and_run_is_failed(run_copy, config):
     text = format_verification(Style(False), report.verification) + format_result(Style(False), report)
     assert "acceptance   FAILED" in text
     assert "2 failed, 1 passed" in text  # the failing output stays visible
-    assert "the model reported the task as done, but the checks did not pass" in text
+    assert "the model reported the task as done and its own checks passed" in text
+    assert "but the final checks did not pass" in text
     assert "RESULT: FAILED" in text
 
 
@@ -135,7 +145,8 @@ def test_verification_runs_even_when_the_agent_hits_a_limit(run_copy, config):
         return sandbox_holder["s"]
 
     model = ScriptedModelClient([tool_reply("list_files")], repeat_last=True)
-    report = run_task(task=TASK, task_path="t", config=config, model=model, model_name="s",
+    report = run_task(task=TASK, task_path="t", config=config,
+                      project=project_for(run_copy, config), model=model, model_name="s",
                       run_copy=run_copy, sandbox_factory=factory)
     assert report.agent.stop_reason == "action limit reached"
     assert sandbox_holder["s"].ran == ["acceptance", "unit_tests"]
@@ -179,4 +190,14 @@ def test_result_shows_timing(run_copy, config):
 def test_task_with_unknown_check_is_refused_early(config):
     bad = Task("x", ["a.py"], ["unit_tests"], ["integration"])
     with pytest.raises(ValueError, match="'integration'"):
-        check_task(bad, config)
+        check_task(bad, config.project("cosmicpython"))
+
+
+def test_check_names_longer_than_the_column_stay_aligned(run_copy):
+    from harness.verification import ScopeResult, VerificationReport
+    checks = [CheckResult(name, ["pytest"], 0, "ok", False, 0.1, "fake")
+              for name in ["acceptance", "integration_sqlite"]]
+    report = VerificationReport(checks, ScopeResult(True, [], []), "", [])
+    rows = [line for line in format_verification(Style(False), report).splitlines()
+            if "PASSED" in line]
+    assert len({row.index("PASSED") for row in rows}) == 1  # one column for all rows

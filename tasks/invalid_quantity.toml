@@ -1,4 +1,8 @@
 # The Stage 1 task: what the agent is asked to do and what it may change.
+
+# The project this task belongs to; it must be listed in config/target.toml.
+project = "cosmicpython"
+
 description = """
 Allocating an order line with a quantity of zero or less must be rejected.
 The allocate handler should raise a new exception InvalidQuantity in
@@ -12,6 +16,10 @@ editable_files = [
     "src/allocation/service_layer/handlers.py",
     "src/allocation/domain/model.py",
 ]
+
+# This task's acceptance tests: the folder acceptance/invalid_quantity.
+# The harness mounts only this folder, read-only, at /acceptance.
+acceptance_tests = "invalid_quantity"
 
 # Checks the agent may run itself. The acceptance check is not listed:
 # the harness runs it after the agent is done.

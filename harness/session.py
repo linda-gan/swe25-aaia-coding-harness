@@ -1,0 +1,422 @@
+"""Sessions: a run's saved state, so it can be shown, reopened and later resumed.
+
+A session is a run folder (workspace/runs/<id>/). Next to the task record
+(task.json) it holds session.json, the checkpoint:
+
+  status            running, verifying, passed, failed, cancelled or paused (as saved)
+  counters          actions, refused actions, retries, fix rounds, steps:
+                    the limits already used
+  pending_action    the step that has started but not finished, or null
+  context           the ContextManager state (marker code, shortened results)
+  messages          the full conversation
+  events, checks, errors
+  working_copy      a fingerprint: starting commit plus a SHA-256 hash of
+                    every changed file, including the harness's own edits
+  verification      the final check results, once the run is over
+
+The checkpoint is written after every completed step, and pending_action just
+before each action or finish check starts. Every write replaces the file in
+one step, so it is never half-written.
+
+Is a session still running? While a run is active, its process holds an
+exclusive lock (flock) on session.lock in the run folder. The operating system
+releases the lock when the process ends in any way, even when it is killed.
+So a session saved as running or verifying whose lock is free belongs to a
+process that is gone: it is shown as interrupted, and an action that was
+pending at that moment is marked as uncertain, because nobody knows whether it
+completed.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import signal
+import time
+from collections import Counter
+from contextlib import contextmanager
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+
+from harness.cancellation import lock_holder
+from harness.config import ProjectConfig
+from harness.task_record import RECORD_NAME, TaskRecord, write_json_atomic
+from harness.workspace import RUNS_DIR, RunCopy, changed_files, git
+
+SESSION_FILE = "session.json"
+LOCK_FILE = "session.lock"
+SESSION_ID = re.compile(r"[A-Za-z0-9-]+")
+
+# Saved statuses
+RUNNING = "running"  # the agent loop is going
+VERIFYING = "verifying"  # the harness is running the final checks
+PASSED = "passed"  # over: all final checks passed
+FAILED = "failed"  # over: at least one final check failed or could not run
+CANCELLED = "cancelled"  # stopped on request (Ctrl+C or cancel); no verification ran
+PAUSED = "paused"  # a resume found problems; see pause_reasons
+# Shown (never saved) for a running or verifying session whose process is gone
+INTERRUPTED = "interrupted"
+
+
+class SessionError(Exception):
+    """A session could not be found or read."""
+
+
+def now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def fingerprint(repo: Path) -> dict:
+    """The working copy's state: HEAD plus a hash of every changed file (None if deleted)."""
+    files = {}
+    for status, path in changed_files(repo):
+        target = repo / path
+        files[path] = (hashlib.sha256(target.read_bytes()).hexdigest()
+                       if target.is_file() else None)
+    return {"head": git(repo, "rev-parse", "HEAD").strip(), "files": files}
+
+
+class Session:
+    def __init__(self, run_dir: Path, data: dict, lock_fd: int | None = None):
+        self.run_dir = Path(run_dir)
+        self.data = data
+        self._lock_fd = lock_fd  # set while this process owns the session
+
+    # ---- creating and loading ------------------------------------------------
+
+    @classmethod
+    def create(cls, run_copy: RunCopy, task_path, project: ProjectConfig,
+               model_name: str) -> "Session":
+        lock_fd = _try_lock(run_copy.run_dir / LOCK_FILE, create=True)
+        if lock_fd is None:
+            raise SessionError(f"Session {run_copy.run_id} is already in use.")
+        data = {
+            "session_id": run_copy.run_id,
+            "created_at": now(),
+            "updated_at": now(),
+            "status": RUNNING,
+            "pid": os.getpid(),
+            "task_file": str(task_path),
+            "project": project.name,
+            "model": model_name,
+            "repo": str(run_copy.repo),
+            "stop_reason": None,
+            "stop_detail": "",
+            "counters": {"actions": 0, "denied": 0, "retries": 0, "fix_rounds": 0, "steps": 0},
+            "pending_action": None,
+            "interrupted_action": None,
+            "cancel_reason": None,
+            "pause_reasons": None,
+            "resumes": [],
+            "context": None,
+            "messages": [],
+            "events": [],
+            "checks": [],
+            "errors": [],
+            "working_copy": fingerprint(run_copy.repo),
+            "verification": None,
+        }
+        session = cls(run_copy.run_dir, data, lock_fd)
+        session.save()
+        return session
+
+    @classmethod
+    def load(cls, run_dir: Path) -> "Session":
+        path = Path(run_dir) / SESSION_FILE
+        try:
+            with open(path, encoding="utf-8") as f:
+                return cls(Path(run_dir), json.load(f))
+        except FileNotFoundError:
+            raise SessionError(f"No session data in {run_dir}.") from None
+        except json.JSONDecodeError as exc:
+            raise SessionError(f"The session file {path} cannot be read: {exc}") from None
+
+    def task_record(self) -> TaskRecord | None:
+        path = self.run_dir / RECORD_NAME
+        return TaskRecord.load(path) if path.is_file() else None
+
+    # ---- saving progress -------------------------------------------------------
+
+    def pending(self, info: dict) -> None:
+        """Save, before it starts, the step that is about to run."""
+        self.data["pending_action"] = {**info, "started_at": now()}
+        self.save()
+
+    def checkpoint(self, run, context_state: dict) -> None:
+        """Save the run's state after a completed step. Clears the pending action."""
+        self.data.update({
+            "updated_at": now(),
+            "stop_reason": run.stop_reason or None,
+            "stop_detail": run.stop_detail,
+            "counters": {"actions": run.actions, "denied": run.denied, "retries": run.retries,
+                         "fix_rounds": run.fix_rounds, "steps": run.steps},
+            "pending_action": None,
+            "interrupted_action": run.interrupted_action,
+            "context": context_state,
+            "messages": run.messages,
+            "events": [asdict(e) for e in run.events],
+            "checks": run.checks,
+            "errors": _errors(run),
+            "working_copy": fingerprint(Path(self.data["repo"])),
+        })
+        self.save()
+
+    def verifying(self) -> None:
+        self.data.update({"status": VERIFYING, "updated_at": now()})
+        self.save()
+
+    def finish(self, verification) -> None:
+        """Save the final check results and release the session."""
+        checks = [{"name": c.name, "status": c.status, "exit_code": c.exit_code,
+                   "error": c.error, "output_tail": c.output[-1500:]}
+                  for c in verification.checks]
+        self.data.update({
+            "status": PASSED if verification.passed else FAILED,
+            "updated_at": now(),
+            "verification": {
+                "passed": verification.passed,
+                "checks": checks,
+                "scope": {"passed": verification.scope.passed, "outside": verification.scope.outside},
+                "changed_files": verification.changed_files,
+            },
+        })
+        self.save()
+        self.close()
+
+    def cancelled(self, reason: str, interrupted_action: dict | None = None) -> None:
+        """Save the stop on request and release the session. No verification runs."""
+        self.data.update({"status": CANCELLED, "cancel_reason": reason, "updated_at": now(),
+                          "pending_action": None})
+        if interrupted_action is not None:
+            self.data["interrupted_action"] = interrupted_action
+        self.save()
+        self.close()
+
+    def pause(self, reasons: list[str]) -> None:
+        """Save the session as paused, with the reasons. Nothing runs."""
+        # Read before taking the lock: while this process holds it, the session
+        # looks running, and an interrupted session would lose its status.
+        uncertain, status = self.uncertain_action, self.status
+        with self.hold():
+            if status != PAUSED:
+                self.data["paused_from"] = status  # why the run stopped in the first place
+            self.data.update({"status": PAUSED, "pause_reasons": reasons, "updated_at": now(),
+                              "pending_action": None, "interrupted_action": uncertain})
+            self.save()
+
+    def reopen(self, accepted: list[str], model_name: str) -> None:
+        """Take the session over to continue it. Keeps the lock until finish/close.
+
+        accepted lists what the user explicitly accepted (with --accept-current-state);
+        it is kept in the session's resume log.
+        """
+        # Read before taking the lock (see pause()).
+        status, uncertain = self.status, self.uncertain_action
+        lock_fd = _try_lock(self.run_dir / LOCK_FILE, create=True)
+        if lock_fd is None:
+            raise SessionError(f"Session {self.session_id} is in use by another process.")
+        self._lock_fd = lock_fd
+        self.data.setdefault("resumes", []).append({
+            "at": now(), "from_status": status, "paused_from": self.data.get("paused_from"),
+            "model": model_name, "accepted": accepted, "uncertain_action": uncertain,
+        })
+        self.data.update({"status": RUNNING, "pid": os.getpid(), "updated_at": now(),
+                          "paused_from": None,
+                          "pending_action": None, "interrupted_action": None,
+                          "cancel_reason": None, "pause_reasons": None, "verification": None,
+                          "model": model_name})
+        self.save()
+
+    @contextmanager
+    def hold(self):
+        """Hold the session lock for a short write, if no one else holds it."""
+        if self._lock_fd is not None:
+            yield  # this process already holds it
+            return
+        fd = _try_lock(self.run_dir / LOCK_FILE, create=True)
+        if fd is None:
+            raise SessionError(f"Session {self.session_id} is in use by another process.")
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def add_review(self, verification) -> None:
+        """Log a review: the final checks run again on the current working copy.
+
+        The session's status stays as it is; a review only looks.
+        """
+        from harness.verification import check_summaries  # verification is a leaf module
+        self.data.setdefault("reviews", []).append({
+            "at": now(), "passed": verification.passed,
+            "checks": check_summaries(verification),  # name, status, one-line detail
+            "scope_passed": verification.scope.passed,
+            "outside": verification.scope.outside,
+            "changed_files": verification.changed_files,
+            # Which part of the session it reviewed: a resume after it starts a new one.
+            "after_resumes": len(self.data.get("resumes", [])),
+        })
+        self.save()
+
+    @property
+    def current_review(self) -> dict | None:
+        """The latest review, if nothing changed the session after it (e.g. a resume)."""
+        reviews = self.data.get("reviews") or []
+        if reviews and reviews[-1]["after_resumes"] == len(self.data.get("resumes", [])):
+            return reviews[-1]
+        return None
+
+    def save(self) -> None:
+        write_json_atomic(self.run_dir / SESSION_FILE, self.data)
+
+    def close(self) -> None:
+        """Release the lock. The session file stays as it is."""
+        if self._lock_fd is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    # ---- what the session looks like now --------------------------------------
+
+    @property
+    def session_id(self) -> str:
+        return self.data["session_id"]
+
+    def is_active(self) -> bool:
+        """True while some process holds the session's lock."""
+        if self._lock_fd is not None:
+            return True
+        fd = _try_lock(self.run_dir / LOCK_FILE, create=False)
+        if fd is None:
+            return (self.run_dir / LOCK_FILE).exists()  # exists but locked: active
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        return False
+
+    @property
+    def status(self) -> str:
+        saved = self.data["status"]
+        if saved in (RUNNING, VERIFYING) and not self.is_active():
+            return INTERRUPTED
+        return saved
+
+    @property
+    def uncertain_action(self) -> dict | None:
+        """The step that was in progress when the run was interrupted or cancelled.
+
+        It may or may not have completed, so it must never be replayed blindly.
+        """
+        status = self.status
+        if status == INTERRUPTED:
+            return self.data.get("pending_action")
+        if status in (CANCELLED, PAUSED):
+            return self.data.get("interrupted_action")
+        return None
+
+    def request_cancel(self) -> int:
+        """Ask the process running this session to stop. Returns its process ID.
+
+        The process is found through the kernel (who holds the session lock),
+        not through the pid saved in session.json, so a changed file cannot
+        make this signal some other process. The harness then stops at its
+        next safe point, or at once if it is waiting for the model or a check.
+        """
+        status = self.status
+        if status not in (RUNNING, VERIFYING):
+            raise SessionError(f"Session {self.session_id} is not running (status: {status}).")
+        pid = lock_holder(self.run_dir / LOCK_FILE)
+        if pid is None:
+            raise SessionError(f"Could not find the process that runs session {self.session_id}.")
+        if pid == os.getpid():
+            raise SessionError("A session cannot cancel itself this way; use Ctrl+C.")
+        os.kill(pid, signal.SIGTERM)
+        return pid
+
+    def wait_until_stopped(self, timeout: float, poll: float = 0.2) -> bool:
+        """Wait until the running process has released the session. True if it did."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.is_active():
+                return True
+            time.sleep(poll)
+        return not self.is_active()
+
+    def progress(self) -> dict[str, int]:
+        """Steps per phase, in the order the phases first appeared."""
+        record = self.task_record()
+        steps = record.steps if record else []
+        return dict(Counter(step["phase"] for step in steps))
+
+
+class SessionStore:
+    """All sessions under one runs folder."""
+
+    def __init__(self, runs_dir: Path = RUNS_DIR):
+        self.runs_dir = Path(runs_dir)
+
+    def all(self) -> list[Session]:
+        """Every readable session, oldest first. Run folders without one are skipped."""
+        if not self.runs_dir.is_dir():
+            return []
+        sessions = []
+        for folder in sorted(self.runs_dir.iterdir()):
+            if (folder / SESSION_FILE).is_file():
+                try:
+                    sessions.append(Session.load(folder))
+                except SessionError:
+                    continue
+        return sessions
+
+    def resolve(self, ref: str) -> Path:
+        """A session folder from its full ID, or a unique start or end of it."""
+        if not isinstance(ref, str) or not SESSION_ID.fullmatch(ref):
+            raise SessionError(f"{ref!r} is not a session ID (letters, digits and '-' only).")
+        ids = [s.session_id for s in self.all()]
+        if ref in ids:
+            return self.runs_dir / ref
+        matches = [i for i in ids if i.startswith(ref) or i.endswith(ref)]
+        if not matches:
+            raise SessionError(f"No session matches {ref!r}. See: python -m harness sessions")
+        if len(matches) > 1:
+            raise SessionError(f"{ref!r} matches several sessions: {', '.join(matches)}. "
+                               "Give more of the ID.")
+        return self.runs_dir / matches[0]
+
+    def open(self, ref: str) -> Session:
+        return Session.load(self.resolve(ref))
+
+
+# ---- helpers ----------------------------------------------------------------
+
+def _try_lock(path: Path, create: bool) -> int | None:
+    """An open, exclusively locked file descriptor, or None if another holds the lock."""
+    flags = os.O_RDWR | (os.O_CREAT if create else 0)
+    try:
+        fd = os.open(path, flags, 0o644)
+    except FileNotFoundError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _errors(run) -> list[dict]:
+    """Refused or failed steps with their message, and a stop caused by an error."""
+    errors = []
+    for message in run.messages:
+        step = message.get("harness_step") or {}
+        content = message.get("content", "")
+        if message.get("role") == "tool" and content.startswith("Error:"):
+            errors.append({"step": step.get("step"), "tool": step.get("tool"),
+                           "message": content[:500]})
+    if run.stop_reason in ("model error", "internal error"):
+        errors.append({"step": None, "tool": "harness",
+                       "message": f"{run.stop_reason}: {run.stop_detail}"[:500]})
+    return errors

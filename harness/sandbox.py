@@ -12,7 +12,8 @@ Each run gets a fresh container that:
 
 Each check runs in two phases: "docker create", then "docker start --attach"
 with the time limit. The container therefore always exists by name before
-the clock starts, so it can always be found and removed afterwards.
+the clock starts, so it can always be found and removed afterwards. It is
+removed in every case, also when a cancel breaks off either phase.
 
 Killing the container stops every process inside it, including child
 processes started by the tests, so a stuck command leaves nothing behind.
@@ -134,52 +135,57 @@ class DockerSandbox:
         def unavailable(error: str, output: str = "") -> CheckResult:
             return result(exit_code=None, output=shorten(output, limit), timed_out=False, error=error)
 
-        # Phase 1: create the container. Creating first means it exists before
-        # the time limit starts, so a timeout can always find and remove it.
+        # The finally block removes the container however this ends: normally,
+        # on a timeout, on an error, or when a cancel breaks off the wait (in
+        # either phase). Removing a container kills every process in it.
         try:
-            created = subprocess.run(
-                self.build_create_command(container, argv),
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
-            )
-        except FileNotFoundError:
-            return unavailable(f"Docker is not installed or not on PATH ({self.docker!r}).")
-        except subprocess.TimeoutExpired:
-            self.stop(container)
-            return unavailable("Docker did not respond while creating the container.")
-        if created.returncode != 0:
-            return unavailable(
-                "Docker could not create the container. Is Docker Desktop running "
-                "and has the sandbox image been built?",
-                _decode(created.stdout),
-            )
+            # Phase 1: create the container. Creating first means it exists before
+            # the time limit starts, so a timeout can always find and remove it.
+            try:
+                created = subprocess.run(
+                    self.build_create_command(container, argv),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+                )
+            except FileNotFoundError:
+                return unavailable(f"Docker is not installed or not on PATH ({self.docker!r}).")
+            except subprocess.TimeoutExpired:
+                return unavailable("Docker did not respond while creating the container.")
+            if created.returncode != 0:
+                return unavailable(
+                    "Docker could not create the container. Is Docker Desktop running "
+                    "and has the sandbox image been built?",
+                    _decode(created.stdout),
+                )
 
-        # Phase 2: start it, wait for it, and always remove it afterwards.
-        try:
-            proc = subprocess.run(
-                [self.docker, "start", "--attach", container],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # one stream, in the order it was printed
-                timeout=self.config.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = _decode(exc.output)
-            output += f"\n[stopped: time limit of {self.config.timeout_seconds}s reached]"
-            return result(exit_code=None, output=shorten(output, limit), timed_out=True)
+            # Phase 2: start it and wait for it, within the time limit.
+            try:
+                proc = subprocess.run(
+                    [self.docker, "start", "--attach", container],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # one stream, in the order it was printed
+                    timeout=self.config.timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                output = _decode(exc.output)
+                output += f"\n[stopped: time limit of {self.config.timeout_seconds}s reached]"
+                return result(exit_code=None, output=shorten(output, limit), timed_out=True)
         finally:
-            # Removing the container kills every process in it, including
-            # child processes the command started in the background.
             self.stop(container)
 
         return result(exit_code=proc.returncode, output=shorten(_decode(proc.stdout), limit), timed_out=False)
 
     def stop(self, container: str) -> None:
-        """Kill and remove a container. Safe to call if it is already gone."""
-        subprocess.run(
-            [self.docker, "rm", "--force", container],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-        )
+        """Kill and remove a container. Safe to call if it is already gone or was
+        never created, and if Docker itself is missing."""
+        try:
+            subprocess.run(
+                [self.docker, "rm", "--force", container],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _decode(data: bytes | str | None) -> str:

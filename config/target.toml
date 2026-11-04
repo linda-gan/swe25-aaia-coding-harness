@@ -1,25 +1,66 @@
-[target]
-url = "https://github.com/cosmicpython/code.git"
-commit = "14c84797ffa77255d53cf1a02fe6aafda2b68aeb"
-regression_tests = "tests/unit"
+# ---- Allowed projects ------------------------------------------------------
+# The harness only works on projects listed here. A task file names its
+# project, and a run is refused unless that project is in this list.
 
+[projects.cosmicpython]
+url = "https://github.com/cosmicpython/code.git"
+commit = "14c84797ffa77255d53cf1a02fe6aafda2b68aeb"   # exact starting commit
+pristine = "workspace/target-pristine"   # clean clone: python -m harness fetch cosmicpython
+image = "cosmic-sandbox"                 # sandbox image with this project's dependencies
+# Checks whose findings are compared with the starting code: only new ones count.
+baseline_checks = ["lint"]
+
+# The only commands that can run in this project's sandbox, by name.
+[projects.cosmicpython.checks]
+unit_tests = ["pytest", "tests/unit", "-q", "-p", "no:cacheprovider"]
+acceptance = ["pytest", "/acceptance", "-q", "-p", "no:cacheprovider"]
+# Integration tests that use an in-memory SQLite database: repository, unit of
+# work and the read model, through the real SQLAlchemy mapping. They need no
+# Postgres, Redis or network. The one Postgres test (concurrent updates) is
+# left out by name; it would wait 10 s for a database and then fail.
+integration_sqlite = [
+    "pytest",
+    "tests/integration/test_repository.py",
+    "tests/integration/test_uow.py",
+    "tests/integration/test_views.py",
+    "-q", "-p", "no:cacheprovider",
+    "-k", "not test_concurrent_updates_to_version_are_not_allowed",
+]
+# Lint with pyflakes. The starting code already has 7 warnings (unused imports),
+# so this check is judged against the starting code: only new warnings count
+# (see baseline_checks above and harness/baseline.py).
+lint = ["python", "-m", "pyflakes", "src"]
+# Build check: every source file must compile, also files no test imports.
+# PYTHONPYCACHEPREFIX sends the .pyc files to /tmp, so nothing is written
+# into the working copy.
+build = ["env", "PYTHONPYCACHEPREFIX=/tmp/pycache", "python", "-m", "compileall", "-q", "src"]
+
+# ---- Shared by all projects -----------------------------------------------
+
+# Resources for every sandbox container (the image is set per project).
 [sandbox]
-image = "cosmic-sandbox"
 timeout_seconds = 120
 memory = "1g"
 cpus = "1"
 max_output_chars = 8000
 
-# The only commands that can run in the sandbox, by name.
-[checks]
-unit_tests = ["pytest", "tests/unit", "-q", "-p", "no:cacheprovider"]
-acceptance = ["pytest", "/acceptance", "-q", "-p", "no:cacheprovider"]
-
 [limits]
-max_actions = 30            # tool calls per run
+max_actions = 30            # tool calls per run (a task file may set its own)
+max_actions_ceiling = 60    # the most a task file may set
 max_denied_actions = 10     # refused or failed tool calls per run
 max_retries = 3             # replies in a row without a usable tool call
+max_fix_rounds = 3          # finish attempts whose checks fail before the run stops
 max_tool_output_chars = 6000
+
+# What is sent to the model per request (see "Context" in the README).
+[context]
+max_tokens = 24000          # size limit per request incl. tool definitions, about 3 characters
+                            # per token; must stay below 90% of num_ctx
+keep_recent_results = 6     # the newest tool results stay in full unless the limit cannot
+                            # be met otherwise
+repo_map_chars = 3000       # repository map in the first message
+selected_files = 4          # files whose outline the harness adds to the first message
+selected_chars = 4000       # for those outlines together
 
 [model]
 host = "http://localhost:11434"

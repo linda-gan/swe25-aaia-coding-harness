@@ -7,6 +7,7 @@ import pytest
 
 from harness.config import LimitsConfig, Task
 from harness.controller import (
+    CHECKS_FAILING,
     ACTION_LIMIT, DENIED_LIMIT, FINISHED, MODEL_ERROR, RETRY_LIMIT, AgentController,
 )
 from harness.model import ModelReply, ScriptedModelClient, ToolCall, tool_reply
@@ -100,7 +101,8 @@ def test_full_fix_edits_file_and_runs_check(repo):
     assert run.stop_reason == FINISHED
     assert run.summary == "Quantities must be positive."
     assert "0 < qty <= 10" in (repo / "src/app/model.py").read_text()
-    assert sandbox.ran == ["unit_tests"]
+    # Once by the model, once by the harness when the model called finish.
+    assert sandbox.ran == ["unit_tests", "unit_tests"]
     assert [e.kind for e in run.events].count("action") == 3
 
 
@@ -132,11 +134,15 @@ def test_invalid_request_gives_error_and_runs_nothing(repo, bad_call):
 
     assert run.denied == 1
     assert tool_messages(run)[0]["content"].startswith("Error:")
-    assert sandbox.ran == []
+    # The refused call ran nothing; the only check is the harness's own at finish.
+    assert sandbox.ran == ["unit_tests"]
     assert (repo / "src/app/model.py").read_text() == ORIGINAL
     assert (repo / "tests/test_model.py").read_text() == "def test_x(): pass\n"
-    # The model was told about the error and could continue.
-    assert model.received[1][-1]["content"].startswith("Error:")
+    # The model was told about the error and could continue. Like every tool
+    # result, the error reaches it inside the untrusted markers.
+    sent = model.received[1][-1]["content"]
+    assert sent.startswith("<<<untrusted ")
+    assert sent.splitlines()[1].startswith("Error:")
 
 
 def test_too_many_refused_actions_stop_the_run(repo):
@@ -183,8 +189,9 @@ def test_large_tool_output_is_shortened_before_reaching_the_model(repo):
     controller.run()
 
     sent = model.received[1][-1]["content"]
-    assert "[output shortened:" in sent
-    assert len(sent) < 600
+    inside_markers = sent.split("\n", 1)[1].rsplit("\n", 1)[0]
+    assert "[output shortened:" in inside_markers
+    assert len(inside_markers) < 600
 
 
 # ---- failures stay visible -------------------------------------------------
@@ -194,14 +201,16 @@ def test_failed_check_output_reaches_the_model(repo):
     controller, model = make_controller(repo, [
         tool_reply("run_check", name="unit_tests"),
         tool_reply("finish", summary="done"),
-    ], sandbox=sandbox)
+    ], sandbox=sandbox, repeat_last=True)  # keeps calling finish
     run = controller.run()
 
     result = model.received[1][-1]["content"]
     assert "FAILED (exit code 1)" in result
     assert "1 failed" in result
-    # finished only means the model said so; it is not a claim that checks pass.
-    assert run.finished
+    # Saying "done" is not enough: the harness's checks at finish fail, so the
+    # run is not finished, and it stops after the last fix round.
+    assert not run.finished
+    assert run.stop_reason == CHECKS_FAILING
 
 
 def test_model_error_stops_the_run_cleanly(repo):

@@ -1,6 +1,6 @@
 # Coding Harness
 
-A small coding agent harness in Python, built for the AAIA semester project (Stage 1 delivered; Stage 2 in progress). It takes a bug-fix or feature task, lets a local language model change a disposable copy of a real repository through checked tools, verifies the result itself in a Docker sandbox, and shows the diff.
+A small coding agent harness in Python, built for the AAIA semester project (Stage 1 and Stage 2 delivered). It takes a bug-fix or feature task, lets a local language model change a disposable copy of a real repository through checked tools, verifies the result itself in a Docker sandbox, and shows the diff.
 
 ```
 python -m harness run tasks/invalid_quantity.toml
